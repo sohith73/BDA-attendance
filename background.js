@@ -1,14 +1,13 @@
 // ==================== FlashFire BDA Attendance - Background Service Worker ====================
 
-const API_BASE_URL = 'http://localhost:5000';
-// const API_BASE_URL = 'https://your-production-api.com';
+import { API_URLS } from './exports.js';
 
 const API = {
-  MY_MEETINGS: `${API_BASE_URL}/api/bda-attendance/my-meetings`,
-  REPORT_JOIN: `${API_BASE_URL}/api/bda-attendance/report-join`,
-  REPORT_LEAVE: `${API_BASE_URL}/api/bda-attendance/report-leave`,
-  MARK_ABSENT: `${API_BASE_URL}/api/bda-attendance/mark-absent`,
-  MANUAL_MARK: `${API_BASE_URL}/api/bda-attendance/manual-mark`,
+  MY_MEETINGS: API_URLS.MY_MEETINGS,
+  REPORT_JOIN: API_URLS.REPORT_JOIN,
+  REPORT_LEAVE: API_URLS.REPORT_LEAVE,
+  MARK_ABSENT: API_URLS.MARK_ABSENT,
+  MANUAL_MARK: API_URLS.MANUAL_MARK,
 };
 
 // ==================== In-Memory Cache (rebuilt from storage on wake) ====================
