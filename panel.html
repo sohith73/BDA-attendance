@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BDA Attendance</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- ==================== Setup Screen ==================== -->
+  <div id="setup-screen" class="setup-container" style="display: none;">
+    <div class="setup-brand">
+      <img src="icons/icon128.png" alt="FlashFire" class="logo">
+      <h1>BDA Attendance</h1>
+      <p>Track your meeting attendance automatically</p>
+    </div>
+
+    <form id="setup-form" class="setup-form">
+      <div class="form-group">
+        <label for="bda-name">Your Name</label>
+        <input type="text" id="bda-name" placeholder="Enter your full name" required autocomplete="name">
+      </div>
+      <div class="form-group">
+        <label for="bda-email">Your Email</label>
+        <input type="email" id="bda-email" placeholder="name@flashfirejobs.com" required autocomplete="email">
+      </div>
+      <button type="submit" id="setup-btn" class="btn-primary">
+        Get Started
+      </button>
+      <div id="setup-error" class="form-error" style="display: none;"></div>
+    </form>
+  </div>
+
+  <!-- ==================== Dashboard ==================== -->
+  <div id="dashboard-screen" class="dashboard-container" style="display: none;">
+    <!-- Header -->
+    <div class="dashboard-header">
+      <div class="header-info">
+        <h2 id="bda-display-name">BDA Name</h2>
+        <p id="bda-display-email">email@example.com</p>
+      </div>
+      <button id="logout-btn" class="btn-logout">Logout</button>
+    </div>
+
+    <!-- Body -->
+    <div class="dashboard-body">
+      <!-- Upcoming Meetings -->
+      <div class="section">
+        <div class="section-title">Upcoming Meetings</div>
+        <div id="upcoming-meetings">
+          <div class="loading-shimmer"></div>
+          <div class="loading-shimmer"></div>
+        </div>
+      </div>
+
+      <!-- Current / Last Meeting -->
+      <div class="section">
+        <div class="section-title">Current / Last Meeting</div>
+        <div id="previous-meetings">
+          <div class="loading-shimmer"></div>
+        </div>
+      </div>
+
+      <!-- Event Log -->
+      <div class="section">
+        <div class="section-title">Activity Log</div>
+        <div class="event-log">
+          <div id="event-log-list" class="event-log-list">
+            <div class="empty-state" id="event-empty">
+              <p>No activity yet</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Connection Bar -->
+    <div class="connection-bar">
+      <div>
+        <span id="connection-dot" class="connection-dot connecting"></span>
+        <span id="connection-status">Connecting...</span>
+      </div>
+      <button id="refresh-btn" class="refresh-btn">Refresh</button>
+    </div>
+  </div>
+
+  <script src="panel.js" type="module"></script>
+</body>
+</html>
