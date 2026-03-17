@@ -8,7 +8,7 @@
 </head>
 <body>
 
-  <!-- ==================== Setup Screen ==================== -->
+  <!-- ==================== Setup Screen - Step 1: Email ==================== -->
   <div id="setup-screen" class="setup-container" style="display: none;">
     <div class="setup-brand">
       <img src="icons/icon128.png" alt="FlashFire" class="logo">
@@ -16,19 +16,47 @@
       <p>Track your meeting attendance automatically</p>
     </div>
 
-    <form id="setup-form" class="setup-form">
-      <div class="form-group">
-        <label for="bda-name">Your Name</label>
-        <input type="text" id="bda-name" placeholder="Enter your full name" required autocomplete="name">
-      </div>
+    <form id="email-form" class="setup-form">
       <div class="form-group">
         <label for="bda-email">Your Email</label>
-        <input type="email" id="bda-email" placeholder="name@flashfirejobs.com" required autocomplete="email">
+        <div class="input-with-icon">
+          <svg class="input-icon" viewBox="0 0 20 20" fill="currentColor" width="16" height="16">
+            <path d="M2.003 5.884L10 9.882l7.997-3.998A2 2 0 0016 4H4a2 2 0 00-1.997 1.884z"/>
+            <path d="M18 8.118l-8 4-8-4V14a2 2 0 002 2h12a2 2 0 002-2V8.118z"/>
+          </svg>
+          <input type="email" id="bda-email" placeholder="name@flashfirejobs.com" required autocomplete="email">
+        </div>
       </div>
-      <button type="submit" id="setup-btn" class="btn-primary">
-        Get Started
+      <button type="submit" id="email-btn" class="btn-primary">
+        Send OTP
       </button>
-      <div id="setup-error" class="form-error" style="display: none;"></div>
+      <div id="email-info" class="form-info" style="display: none;"></div>
+      <div id="email-error" class="form-error" style="display: none;"></div>
+    </form>
+  </div>
+
+  <!-- ==================== Setup Screen - Step 2: OTP ==================== -->
+  <div id="otp-screen" class="setup-container" style="display: none;">
+    <div class="setup-brand">
+      <img src="icons/icon128.png" alt="FlashFire" class="logo">
+      <h1>Enter OTP</h1>
+      <p>We sent a 6-digit code to</p>
+      <p class="otp-email-display" id="otp-email-display">email@example.com</p>
+    </div>
+
+    <form id="otp-form" class="setup-form">
+      <div class="form-group">
+        <label for="otp-input">One-Time Password</label>
+        <input type="text" id="otp-input" placeholder="- - - - - -" required maxlength="6" inputmode="numeric" pattern="\d{6}" autocomplete="one-time-code">
+      </div>
+      <button type="submit" id="otp-btn" class="btn-primary" disabled>
+        Verify & Login
+      </button>
+      <div id="otp-error" class="form-error" style="display: none;"></div>
+      <div class="otp-actions">
+        <button type="button" id="change-email-btn" class="btn-link">Change email</button>
+        <button type="button" id="resend-otp-btn" class="btn-link">Resend OTP</button>
+      </div>
     </form>
   </div>
 

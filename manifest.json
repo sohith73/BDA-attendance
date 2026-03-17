@@ -23,6 +23,11 @@
       "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_end"
+    },
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["meet-content.js"],
+      "run_at": "document_end"
     }
   ],
   "action": {
@@ -39,7 +44,8 @@
         "panel.html",
         "panel.js",
         "styles.css",
-        "exports.js"
+        "exports.js",
+        "meet-content.js"
       ],
       "matches": ["<all_urls>"]
     }

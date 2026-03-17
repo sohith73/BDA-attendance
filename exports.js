@@ -4,7 +4,8 @@ export const API_BASE_URL = 'https://flashfire-backend-9wv0.onrender.com';
 
 // API Endpoints
 export const API_ENDPOINTS = {
-  REGISTER: '/api/bda-attendance/register',
+  REQUEST_OTP: '/api/bda-attendance/request-otp',
+  VERIFY_OTP: '/api/bda-attendance/verify-otp',
   MY_MEETINGS: '/api/bda-attendance/my-meetings',
   REPORT_JOIN: '/api/bda-attendance/report-join',
   REPORT_LEAVE: '/api/bda-attendance/report-leave',
@@ -15,7 +16,8 @@ export const API_ENDPOINTS = {
 
 // Full API URLs
 export const API_URLS = {
-  REGISTER: `${API_BASE_URL}${API_ENDPOINTS.REGISTER}`,
+  REQUEST_OTP: `${API_BASE_URL}${API_ENDPOINTS.REQUEST_OTP}`,
+  VERIFY_OTP: `${API_BASE_URL}${API_ENDPOINTS.VERIFY_OTP}`,
   MY_MEETINGS: `${API_BASE_URL}${API_ENDPOINTS.MY_MEETINGS}`,
   REPORT_JOIN: `${API_BASE_URL}${API_ENDPOINTS.REPORT_JOIN}`,
   REPORT_LEAVE: `${API_BASE_URL}${API_ENDPOINTS.REPORT_LEAVE}`,

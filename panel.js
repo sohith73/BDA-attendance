@@ -5,12 +5,26 @@ import { API_URLS, API_BASE_URL } from './exports.js';
 // ==================== DOM Elements ====================
 
 const setupScreen = document.getElementById('setup-screen');
+const otpScreen = document.getElementById('otp-screen');
 const dashboardScreen = document.getElementById('dashboard-screen');
-const setupForm = document.getElementById('setup-form');
-const setupBtn = document.getElementById('setup-btn');
-const setupError = document.getElementById('setup-error');
-const bdaNameInput = document.getElementById('bda-name');
+
+// Email step
+const emailForm = document.getElementById('email-form');
+const emailBtn = document.getElementById('email-btn');
+const emailError = document.getElementById('email-error');
+const emailInfo = document.getElementById('email-info');
 const bdaEmailInput = document.getElementById('bda-email');
+
+// OTP step
+const otpForm = document.getElementById('otp-form');
+const otpBtn = document.getElementById('otp-btn');
+const otpError = document.getElementById('otp-error');
+const otpInput = document.getElementById('otp-input');
+const otpEmailDisplay = document.getElementById('otp-email-display');
+const changeEmailBtn = document.getElementById('change-email-btn');
+const resendOtpBtn = document.getElementById('resend-otp-btn');
+
+// Dashboard
 const bdaDisplayName = document.getElementById('bda-display-name');
 const bdaDisplayEmail = document.getElementById('bda-display-email');
 const logoutBtn = document.getElementById('logout-btn');
@@ -30,6 +44,7 @@ let meetings = null;
 let eventSource = null;
 let sseReconnectTimeout = null;
 let sseReconnectDelay = 1000;
+let pendingEmail = null; // email waiting for OTP verification
 
 // ==================== Init ====================
 
@@ -40,40 +55,99 @@ async function init() {
     bdaInfo = auth.bdaInfo;
     showDashboard();
   } else {
-    showSetup();
+    showEmailStep();
   }
 }
 
-// ==================== Setup ====================
+// ==================== Auth Flow - Step 1: Email ====================
 
-function showSetup() {
+function showEmailStep() {
   setupScreen.style.display = 'flex';
+  otpScreen.style.display = 'none';
   dashboardScreen.style.display = 'none';
   disconnectSSE();
+  emailError.style.display = 'none';
+  emailInfo.style.display = 'none';
 }
 
-setupForm.addEventListener('submit', async (e) => {
+emailForm.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const name = bdaNameInput.value.trim();
   const email = bdaEmailInput.value.trim();
+  if (!email) return;
 
-  if (!name || !email) return;
+  await requestOtp(email);
+});
 
-  setupBtn.disabled = true;
-  setupBtn.innerHTML = '<span class="spinner"></span> Registering...';
-  setupError.style.display = 'none';
+async function requestOtp(email) {
+  emailBtn.disabled = true;
+  emailBtn.innerHTML = '<span class="spinner"></span> Sending OTP...';
+  emailError.style.display = 'none';
+  emailInfo.style.display = 'none';
 
   try {
-    const res = await fetch(API_URLS.REGISTER, {
+    const res = await fetch(API_URLS.REQUEST_OTP, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, email }),
+      body: JSON.stringify({ email }),
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to send OTP');
+    }
+
+    pendingEmail = email;
+    showOtpStep();
+  } catch (err) {
+    emailError.textContent = err.message;
+    emailError.style.display = 'block';
+  } finally {
+    emailBtn.disabled = false;
+    emailBtn.innerHTML = 'Send OTP';
+  }
+}
+
+// ==================== Auth Flow - Step 2: OTP ====================
+
+function showOtpStep() {
+  setupScreen.style.display = 'none';
+  otpScreen.style.display = 'flex';
+  dashboardScreen.style.display = 'none';
+  otpEmailDisplay.textContent = pendingEmail;
+  otpInput.value = '';
+  otpError.style.display = 'none';
+  otpBtn.disabled = true;
+  otpInput.focus();
+}
+
+// Enable verify button only when 6 digits entered
+otpInput.addEventListener('input', () => {
+  // Only allow digits
+  otpInput.value = otpInput.value.replace(/\D/g, '');
+  otpBtn.disabled = otpInput.value.length !== 6;
+});
+
+otpForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const otp = otpInput.value.trim();
+  if (!otp || otp.length !== 6 || !pendingEmail) return;
+
+  otpBtn.disabled = true;
+  otpBtn.innerHTML = '<span class="spinner"></span> Verifying...';
+  otpError.style.display = 'none';
+
+  try {
+    const res = await fetch(API_URLS.VERIFY_OTP, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingEmail, otp }),
     });
 
     const data = await res.json();
 
     if (!data.success) {
-      throw new Error(data.error || 'Registration failed');
+      throw new Error(data.error || 'Verification failed');
     }
 
     token = data.token;
@@ -86,13 +160,57 @@ setupForm.addEventListener('submit', async (e) => {
       bdaInfo: data.bda,
     });
 
+    pendingEmail = null;
     showDashboard();
   } catch (err) {
-    setupError.textContent = err.message;
-    setupError.style.display = 'block';
+    otpError.textContent = err.message;
+    otpError.style.display = 'block';
+    otpInput.value = '';
+    otpBtn.disabled = true;
+    otpInput.focus();
   } finally {
-    setupBtn.disabled = false;
-    setupBtn.innerHTML = 'Get Started';
+    otpBtn.disabled = otpInput.value.length !== 6;
+    otpBtn.innerHTML = 'Verify & Login';
+  }
+});
+
+// Change email - go back to step 1
+changeEmailBtn.addEventListener('click', () => {
+  pendingEmail = null;
+  showEmailStep();
+});
+
+// Resend OTP
+resendOtpBtn.addEventListener('click', async () => {
+  if (!pendingEmail) return;
+  resendOtpBtn.disabled = true;
+  resendOtpBtn.textContent = 'Sending...';
+  otpError.style.display = 'none';
+
+  try {
+    const res = await fetch(API_URLS.REQUEST_OTP, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: pendingEmail }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to resend');
+
+    resendOtpBtn.textContent = 'OTP Sent!';
+    otpInput.value = '';
+    otpBtn.disabled = true;
+    otpInput.focus();
+
+    setTimeout(() => {
+      resendOtpBtn.textContent = 'Resend OTP';
+      resendOtpBtn.disabled = false;
+    }, 3000);
+  } catch (err) {
+    otpError.textContent = err.message;
+    otpError.style.display = 'block';
+    resendOtpBtn.textContent = 'Resend OTP';
+    resendOtpBtn.disabled = false;
   }
 });
 
@@ -100,6 +218,7 @@ setupForm.addEventListener('submit', async (e) => {
 
 function showDashboard() {
   setupScreen.style.display = 'none';
+  otpScreen.style.display = 'none';
   dashboardScreen.style.display = 'flex';
 
   if (bdaInfo) {
@@ -118,7 +237,7 @@ logoutBtn.addEventListener('click', async () => {
   token = null;
   bdaInfo = null;
   meetings = null;
-  showSetup();
+  showEmailStep();
 });
 
 refreshBtn.addEventListener('click', () => {

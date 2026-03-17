@@ -170,6 +170,93 @@ body {
   font-size: 12px;
   margin-top: 8px;
   text-align: center;
+  background: #fef2f2;
+  padding: 8px 12px;
+  border-radius: var(--ff-radius-sm);
+  border: 1px solid #fecaca;
+}
+
+.form-info {
+  color: var(--ff-orange);
+  font-size: 12px;
+  margin-top: 8px;
+  text-align: center;
+  background: #fff7ed;
+  padding: 8px 12px;
+  border-radius: var(--ff-radius-sm);
+  border: 1px solid #fed7aa;
+}
+
+/* ==================== Input with Icon ==================== */
+
+.input-with-icon {
+  position: relative;
+}
+
+.input-with-icon .input-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ff-gray-400);
+  pointer-events: none;
+}
+
+.input-with-icon input {
+  padding-left: 38px;
+}
+
+/* ==================== OTP Screen ==================== */
+
+.otp-email-display {
+  color: var(--ff-orange);
+  font-weight: 600;
+  font-size: 13px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+
+#otp-input {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0.35em;
+  text-align: center;
+  padding-left: 14px !important;
+}
+
+#otp-input::placeholder {
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: 0.4em;
+  color: var(--ff-gray-300);
+}
+
+.otp-actions {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 16px;
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--ff-orange);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 0;
+  transition: color var(--ff-transition);
+}
+
+.btn-link:hover {
+  color: var(--ff-orange-dark);
+  text-decoration: underline;
+}
+
+.btn-link:disabled {
+  color: var(--ff-gray-400);
+  cursor: not-allowed;
+  text-decoration: none;
 }
 
 /* ==================== Dashboard ==================== */
