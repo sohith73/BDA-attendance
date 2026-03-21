@@ -17,6 +17,10 @@
   let bdaInfo = null;
   let authChecked = false;
 
+  const FF_WIDGET_POS_KEY = 'ffMeetWidgetPos';
+  const DRAG_THRESHOLD_PX = 8;
+  let widgetDrag = null; // { startX, startY, startLeft, startTop, pointerId, togglePointer, dragging }
+
   // ==================== Call State Detection ====================
 
   function detectInCall() {
@@ -152,6 +156,164 @@
     return match2 ? match2[1].toLowerCase() : null;
   }
 
+  // ==================== Widget position (draggable) ====================
+
+  function applyWidgetPosition(left, top) {
+    if (!widget) return;
+    widget.style.left = `${Math.round(left)}px`;
+    widget.style.top = `${Math.round(top)}px`;
+    widget.style.right = 'auto';
+    widget.style.bottom = 'auto';
+  }
+
+  function defaultWidgetPosition() {
+    const pad = 16;
+    const bottom = 80;
+    const toggleH = 48;
+    return {
+      left: pad,
+      top: Math.max(pad, window.innerHeight - bottom - toggleH),
+    };
+  }
+
+  function clampWidgetPosition(left, top) {
+    if (!widget) return { left, top };
+    applyWidgetPosition(left, top);
+    const toggle = widget.querySelector('.ff-toggle');
+    const card = widget.querySelector('.ff-card');
+    const pad = 8;
+    let minL = Infinity;
+    let minT = Infinity;
+    let maxR = -Infinity;
+    let maxB = -Infinity;
+    const rects = [toggle.getBoundingClientRect()];
+    if (card && card.classList.contains('open')) rects.push(card.getBoundingClientRect());
+    for (const r of rects) {
+      minL = Math.min(minL, r.left);
+      minT = Math.min(minT, r.top);
+      maxR = Math.max(maxR, r.right);
+      maxB = Math.max(maxB, r.bottom);
+    }
+    if (minL === Infinity) return { left, top };
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let nl = left;
+    let nt = top;
+    if (minL < pad) nl += pad - minL;
+    if (minT < pad) nt += pad - minT;
+    if (maxR > vw - pad) nl -= maxR - (vw - pad);
+    if (maxB > vh - pad) nt -= maxB - (vh - pad);
+    return { left: nl, top: nt };
+  }
+
+  function persistWidgetPosition(left, top) {
+    try {
+      chrome.storage.local.set({ [FF_WIDGET_POS_KEY]: { left, top } });
+    } catch (_) {}
+  }
+
+  function loadWidgetPositionThen(then) {
+    chrome.storage.local.get(FF_WIDGET_POS_KEY, (data) => {
+      const pos = data && data[FF_WIDGET_POS_KEY];
+      if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+        const c = clampWidgetPosition(pos.left, pos.top);
+        applyWidgetPosition(c.left, c.top);
+      }
+      if (typeof then === 'function') then();
+    });
+  }
+
+  function attachWidgetDrag() {
+    if (!widget || widget.dataset.ffDragBound === '1') return;
+    widget.dataset.ffDragBound = '1';
+
+    widget.addEventListener(
+      'pointerdown',
+      (e) => {
+        if (e.button !== 0) return;
+        if (e.target.closest('#ff-btn')) return;
+        const toggleEl = e.target.closest('#ff-toggle');
+        const rect = widget.getBoundingClientRect();
+        widgetDrag = {
+          startX: e.clientX,
+          startY: e.clientY,
+          startLeft: rect.left,
+          startTop: rect.top,
+          pointerId: e.pointerId,
+          togglePointer: !!toggleEl,
+          dragging: false,
+        };
+        try {
+          widget.setPointerCapture(e.pointerId);
+        } catch (_) {}
+      },
+      true
+    );
+
+    widget.addEventListener('pointermove', (e) => {
+      if (!widgetDrag || e.pointerId !== widgetDrag.pointerId) return;
+      const dx = e.clientX - widgetDrag.startX;
+      const dy = e.clientY - widgetDrag.startY;
+      if (!widgetDrag.dragging) {
+        if (dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
+        widgetDrag.dragging = true;
+        widget.classList.add('ff-dragging');
+      }
+      let left = widgetDrag.startLeft + dx;
+      let top = widgetDrag.startTop + dy;
+      const c = clampWidgetPosition(left, top);
+      applyWidgetPosition(c.left, c.top);
+    });
+
+    widget.addEventListener('pointerup', (e) => {
+      if (!widgetDrag || e.pointerId !== widgetDrag.pointerId) return;
+      const wasDrag = widgetDrag.dragging;
+      const fromToggle = widgetDrag.togglePointer;
+      try {
+        widget.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+      widget.classList.remove('ff-dragging');
+      widgetDrag = null;
+
+      if (wasDrag) {
+        const rect = widget.getBoundingClientRect();
+        persistWidgetPosition(rect.left, rect.top);
+        e.preventDefault();
+        return;
+      }
+      if (fromToggle) {
+        document.getElementById('ff-card').classList.toggle('open');
+        const rect = widget.getBoundingClientRect();
+        const c = clampWidgetPosition(rect.left, rect.top);
+        applyWidgetPosition(c.left, c.top);
+      }
+    });
+
+    widget.addEventListener('pointercancel', (e) => {
+      if (!widgetDrag || e.pointerId !== widgetDrag.pointerId) return;
+      try {
+        widget.releasePointerCapture(e.pointerId);
+      } catch (_) {}
+      widget.classList.remove('ff-dragging');
+      if (widgetDrag.dragging) {
+        const rect = widget.getBoundingClientRect();
+        persistWidgetPosition(rect.left, rect.top);
+      }
+      widgetDrag = null;
+    });
+
+    let resizeT = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeT);
+      resizeT = setTimeout(() => {
+        if (!widget) return;
+        const rect = widget.getBoundingClientRect();
+        const c = clampWidgetPosition(rect.left, rect.top);
+        applyWidgetPosition(c.left, c.top);
+      }, 100);
+    });
+  }
+
   // ==================== Widget ====================
 
   function createWidget() {
@@ -163,11 +325,17 @@
       <style>
         #ff-bda-meet-widget {
           position: fixed;
-          bottom: 80px;
-          left: 16px;
           z-index: 2147483646;
           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          touch-action: none;
+          user-select: none;
+          -webkit-user-select: none;
         }
+        #ff-bda-meet-widget.ff-dragging { cursor: grabbing; }
+        #ff-bda-meet-widget.ff-dragging .ff-toggle { cursor: grabbing; }
+        #ff-bda-meet-widget .ff-hdr { cursor: grab; }
+        #ff-bda-meet-widget .ff-toggle { cursor: grab; }
+        #ff-bda-meet-widget .ff-btn { cursor: pointer; }
         #ff-bda-meet-widget * { box-sizing: border-box; margin: 0; padding: 0; }
 
         .ff-toggle {
@@ -278,8 +446,10 @@
 
     document.body.appendChild(widget);
 
-    document.getElementById('ff-toggle').addEventListener('click', () => {
-      document.getElementById('ff-card').classList.toggle('open');
+    const defPos = defaultWidgetPosition();
+    applyWidgetPosition(defPos.left, defPos.top);
+    loadWidgetPositionThen(() => {
+      attachWidgetDrag();
     });
 
     document.getElementById('ff-btn').addEventListener('click', () => {
