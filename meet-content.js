@@ -9,7 +9,9 @@
 
   // ==================== Constants ====================
 
-  const BEACON_LEAVE_URL = 'https://flashfire-backend-9wv0.onrender.com/api/bda-attendance/beacon-leave';
+  const BEACON_LEAVE_URL = 'http://localhost:5000/api/bda-attendance/beacon-leave';
+  const BEACON_END_EVENT_URL = 'http://localhost:5000/api/bda-attendance/beacon-end-event';
+  // Production: swap hosts to https://flashfire-backend-9wv0.onrender.com
   const FALLBACK_POPUP_DELAY_MS = 30000; // Show fallback popup after 30s if auto-attendance fails
   const FALLBACK_POLL_INTERVAL_MS = 10000; // 10s safety-net poll (backup for MutationObserver)
 
@@ -26,10 +28,59 @@
   let storedToken = null; // Cached for sendBeacon (can't set auth headers)
   let fallbackPopupTimeout = null;
   let beaconSent = false; // Prevent duplicate beacons per session
+  let currentMeetLink = null; // The meet link for this session
+  /** Stable id per in-call session for deduping end events (message + beacon) */
+  let sessionEndRequestId = null;
+
+  function getSessionEndRequestId() {
+    if (!sessionEndRequestId) {
+      sessionEndRequestId = `ff_sess_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+    }
+    return sessionEndRequestId;
+  }
 
   const FF_WIDGET_POS_KEY = 'ffMeetWidgetPos';
+  const FF_SESSION_KEY = 'ff_active_session';
+  const SESSION_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour max session
   const DRAG_THRESHOLD_PX = 8;
   let widgetDrag = null;
+
+  // ==================== Meet-Link Session Tracking ====================
+  // Persists join timestamp to chrome.storage so duration survives page reloads
+
+  function saveSession(meetLink, joinedAt) {
+    currentMeetLink = meetLink;
+    try {
+      chrome.storage.local.set({
+        [FF_SESSION_KEY]: { meetLink, joinedAt, bookingId: currentBooking?.bookingId || null },
+      });
+    } catch (_) {}
+  }
+
+  function clearSession() {
+    try {
+      chrome.storage.local.remove(FF_SESSION_KEY);
+    } catch (_) {}
+  }
+
+  async function restoreSession() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(FF_SESSION_KEY, (data) => {
+          const session = data?.[FF_SESSION_KEY];
+          if (!session) return resolve(null);
+          // Expire sessions older than 1 hour
+          if (Date.now() - session.joinedAt > SESSION_MAX_AGE_MS) {
+            clearSession();
+            return resolve(null);
+          }
+          resolve(session);
+        });
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
 
   // ==================== Call State Detection ====================
 
@@ -64,27 +115,73 @@
   // ==================== sendBeacon Leave (fire-and-forget) ====================
 
   function sendBeaconLeave() {
-    if (beaconSent || !currentBooking?.bookingId || !storedToken) return;
+    if (beaconSent || !storedToken) return;
     beaconSent = true;
 
+    const requestId = getSessionEndRequestId();
+    const meetLink = currentMeetLink || window.location.href;
+    const leftAt = new Date().toISOString();
+    const joinedAtSnapshot = callStartTime ? new Date(callStartTime).toISOString() : undefined;
+    const durationMsSnapshot = callStartTime ? Date.now() - callStartTime : undefined;
+
     try {
-      const blob = new Blob(
-        [
-          JSON.stringify({
-            bookingId: currentBooking.bookingId,
-            leftAt: new Date().toISOString(),
-            token: storedToken,
-            source: 'beacon',
-          }),
-        ],
-        { type: 'application/json' }
-      );
-      navigator.sendBeacon(BEACON_LEAVE_URL, blob);
-      console.log('[FF-MEET] Beacon leave sent for', currentBooking.bookingId);
+      if (currentBooking?.bookingId) {
+        const blob = new Blob(
+          [
+            JSON.stringify({
+              bookingId: currentBooking.bookingId,
+              leftAt,
+              token: storedToken,
+              endRequestId: requestId,
+              endMeetLink: meetLink,
+              endSource: 'beacon',
+              joinedAtSnapshot,
+              durationMsSnapshot,
+            }),
+          ],
+          { type: 'application/json' }
+        );
+        navigator.sendBeacon(BEACON_LEAVE_URL, blob);
+        console.log('[FF-MEET] Beacon leave sent for', currentBooking.bookingId);
+      } else {
+        const blob = new Blob(
+          [
+            JSON.stringify({
+              token: storedToken,
+              meetLink,
+              leftAt,
+              endSource: 'beacon',
+              requestId,
+              joinedAtSnapshot,
+              durationMsSnapshot,
+            }),
+          ],
+          { type: 'application/json' }
+        );
+        navigator.sendBeacon(BEACON_END_EVENT_URL, blob);
+        console.log('[FF-MEET] Beacon end-event sent (no booking id)');
+      }
     } catch (err) {
       console.warn('[FF-MEET] sendBeacon failed:', err.message);
-      beaconSent = false; // Allow retry
+      beaconSent = false;
     }
+  }
+
+  /** Extension UI / call-ended → background → report-end-event */
+  function notifyMeetingEnd(endSource) {
+    const requestId = getSessionEndRequestId();
+    const durationMs = callStartTime ? Date.now() - callStartTime : 0;
+    const duration = getElapsedStr();
+    chrome.runtime.sendMessage({
+      type: 'MEET_CALL_ENDED',
+      url: currentMeetLink || window.location.href,
+      duration,
+      durationMs,
+      endSource,
+      requestId,
+      joinedAtMs: callStartTime,
+      bookingId: currentBooking?.bookingId || undefined,
+    });
   }
 
   // ==================== Leave Button Click Interceptor ====================
@@ -141,14 +238,25 @@
   function getElapsedStr() {
     if (!callStartTime) return '0:00';
     const elapsed = Date.now() - callStartTime;
-    const mins = Math.floor(elapsed / 60000);
+    const hrs = Math.floor(elapsed / 3600000);
+    const mins = Math.floor((elapsed % 3600000) / 60000);
     const secs = Math.floor((elapsed % 60000) / 1000);
+    if (hrs > 0) return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
     return `${mins}:${String(secs).padStart(2, '0')}`;
+  }
+
+  function getElapsedMinStr() {
+    if (!callStartTime) return '0 min';
+    const elapsed = Date.now() - callStartTime;
+    const mins = Math.round(elapsed / 60000);
+    return `${mins} min`;
   }
 
   // ==================== Fallback In-Page Popup ====================
 
   function showFallbackPopup() {
+    // Don't show if attendance already confirmed
+    if (joinReported) return;
     if (document.getElementById('ff-fallback-popup')) return;
 
     const hasBooking = !!currentBooking;
@@ -177,8 +285,8 @@
           border-radius: 12px;
           box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25), 0 0 0 2px #ff5722;
           padding: 16px 20px;
-          min-width: 320px;
-          max-width: 420px;
+          min-width: 340px;
+          max-width: 440px;
         }
         .ff-popup-card.minimized {
           min-width: auto;
@@ -203,77 +311,94 @@
         }
         @keyframes ff-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
         .ff-popup-title {
-          font-size: 14px;
-          font-weight: 700;
-          color: #dc2626;
-          margin-bottom: 6px;
-          display: flex;
-          align-items: center;
-          gap: 6px;
+          font-size: 14px; font-weight: 700; color: #dc2626;
+          margin-bottom: 4px;
+        }
+        .ff-popup-dur {
+          font-size: 12px; color: #6b7280; margin-bottom: 8px;
+          font-weight: 600;
+        }
+        .ff-popup-dur span { color: #374151; font-weight: 700; }
+        .ff-popup-meet {
+          font-size: 10px; color: #9ca3af; margin-bottom: 8px;
+          word-break: break-all;
         }
         .ff-popup-msg {
-          font-size: 12px;
-          color: #4b5563;
-          margin-bottom: 12px;
-          line-height: 1.4;
+          font-size: 12px; color: #4b5563;
+          margin-bottom: 12px; line-height: 1.4;
         }
         .ff-popup-actions {
-          display: flex;
-          gap: 8px;
+          display: flex; gap: 8px; flex-wrap: wrap;
         }
         .ff-popup-mark {
-          flex: 1;
-          padding: 8px 16px;
-          background: #10b981;
-          color: white;
-          border: none;
-          border-radius: 8px;
-          font-size: 13px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: background 0.2s;
+          flex: 1; min-width: 100px;
+          padding: 8px 12px;
+          background: #10b981; color: white; border: none;
+          border-radius: 8px; font-size: 12px; font-weight: 600;
+          cursor: pointer; transition: background 0.2s;
         }
         .ff-popup-mark:hover { background: #059669; }
         .ff-popup-mark:disabled { background: #d1d5db; color: #6b7280; cursor: not-allowed; }
+        .ff-popup-end {
+          flex: 1; min-width: 100px;
+          padding: 8px 12px;
+          background: #dc2626; color: white; border: none;
+          border-radius: 8px; font-size: 12px; font-weight: 600;
+          cursor: pointer; transition: background 0.2s;
+        }
+        .ff-popup-end:hover { background: #b91c1c; }
+        .ff-popup-end:disabled { background: #d1d5db; color: #6b7280; cursor: not-allowed; }
         .ff-popup-min {
           padding: 8px 12px;
-          background: #f3f4f6;
-          color: #6b7280;
-          border: none;
-          border-radius: 8px;
-          font-size: 12px;
-          cursor: pointer;
-          transition: background 0.2s;
+          background: #f3f4f6; color: #6b7280; border: none;
+          border-radius: 8px; font-size: 12px;
+          cursor: pointer; transition: background 0.2s;
         }
         .ff-popup-min:hover { background: #e5e7eb; }
       </style>
       <div class="ff-popup-card" id="ff-popup-card">
         <div class="ff-popup-full">
           <div class="ff-popup-title">
-            <span>Attendance Not Detected</span>
+            ${hasBooking ? 'Mark Attendance' : 'Attendance Not Detected'}
           </div>
+          <div class="ff-popup-dur">
+            Duration: <span id="ff-popup-dur-val">${getElapsedStr()}</span>
+          </div>
+          <div class="ff-popup-meet">${window.location.href}</div>
           <div class="ff-popup-msg">
             ${
               hasBooking
-                ? `Auto-attendance could not be confirmed for <strong>${clientName}</strong>. Please mark your presence manually.`
-                : `No scheduled meeting found for this call. If you have a meeting now, please mark present or contact admin.`
+                ? `Meeting: <strong>${clientName}</strong> — mark present or end meet.`
+                : `No scheduled meeting found for this call. Use <strong>End Meet</strong> to record time spent (meet link is sent to the server).`
             }
           </div>
-          <div class="ff-popup-actions">
-            <button class="ff-popup-mark" id="ff-popup-mark-btn"${hasBooking ? '' : ' disabled'}>
-              ${hasBooking ? 'Mark Present' : 'No Meeting Found'}
-            </button>
-            <button class="ff-popup-min" id="ff-popup-min-btn">Minimize</button>
+          <div class="ff-popup-actions" style="flex-direction:column;">
+            <button class="ff-popup-end" id="ff-popup-end-btn" style="width:100%;">End Meet</button>
+            <div style="display:flex; gap:8px;">
+              <button class="ff-popup-mark" id="ff-popup-mark-btn"${hasBooking ? '' : ' style="display:none;"'}>
+                Mark Present
+              </button>
+              <button class="ff-popup-min" id="ff-popup-min-btn">Minimize</button>
+            </div>
           </div>
         </div>
         <div class="ff-popup-pill">
           <div class="ff-popup-pill-dot"></div>
-          <span>Attendance pending — tap to mark</span>
+          <span id="ff-popup-pill-text">In call — ${getElapsedStr()}</span>
         </div>
       </div>
     `;
 
     document.body.appendChild(popup);
+
+    // Update duration in popup every second
+    const popupDurInterval = setInterval(() => {
+      const durEl = document.getElementById('ff-popup-dur-val');
+      const pillText = document.getElementById('ff-popup-pill-text');
+      if (durEl) durEl.textContent = getElapsedStr();
+      if (pillText) pillText.textContent = `In call — ${getElapsedStr()}`;
+      if (!document.getElementById('ff-fallback-popup')) clearInterval(popupDurInterval);
+    }, 1000);
 
     // Mark Present button
     const markBtn = document.getElementById('ff-popup-mark-btn');
@@ -294,29 +419,58 @@
               updateWidgetState('present', 'Present - Attendance recorded');
             } else {
               markBtn.disabled = false;
-              markBtn.textContent = 'Retry - Mark Present';
+              markBtn.textContent = 'Mark Present';
+              if (response?.markedAbsent || response?.error) {
+                updateWidgetState('idle', response.error || 'Use the real Meet room link.');
+              }
             }
           }
         );
       });
     }
 
+    // End Meet button in popup
+    const popupEndBtn = document.getElementById('ff-popup-end-btn');
+    if (popupEndBtn) {
+      popupEndBtn.addEventListener('click', () => {
+        popupEndBtn.disabled = true;
+        popupEndBtn.textContent = 'Ending...';
+
+        const duration = getElapsedStr();
+        const durationMs = callStartTime ? Date.now() - callStartTime : 0;
+        console.log('[FF-MEET] Popup End Meet clicked. Duration:', duration, `(${Math.round(durationMs / 60000)} min)`, 'Meet:', currentMeetLink || window.location.href);
+
+        notifyMeetingEnd('fallback_popup');
+
+        isInCall = false;
+        clearSession();
+        clearInterval(popupDurInterval);
+        removeFallbackPopup();
+        updateWidgetState('idle', 'Call ended - ' + duration);
+      });
+    }
+
     // Minimize button
     const minBtn = document.getElementById('ff-popup-min-btn');
     if (minBtn) {
-      minBtn.addEventListener('click', () => {
+      minBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
         const card = document.getElementById('ff-popup-card');
         if (card) card.classList.add('minimized');
       });
     }
 
-    // Click pill to expand
-    popup.addEventListener('click', (e) => {
-      const card = document.getElementById('ff-popup-card');
-      if (card?.classList.contains('minimized') && !e.target.closest('.ff-popup-mark')) {
-        card.classList.remove('minimized');
-      }
-    });
+    // Click on pill area to expand back
+    const pillArea = popup.querySelector('.ff-popup-pill');
+    if (pillArea) {
+      pillArea.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const card = document.getElementById('ff-popup-card');
+        if (card?.classList.contains('minimized')) {
+          card.classList.remove('minimized');
+        }
+      });
+    }
   }
 
   function removeFallbackPopup() {
@@ -332,6 +486,10 @@
     isInCall = true;
     if (!callStartTime) callStartTime = Date.now();
     beaconSent = false; // Reset for new session
+    currentMeetLink = window.location.href;
+
+    // Persist session so duration survives page reloads
+    saveSession(currentMeetLink, callStartTime);
 
     console.log('[FF-MEET] In-call detected! Reporting to background...');
 
@@ -367,8 +525,17 @@
             currentBooking = response.booking;
           }
           removeFallbackPopup();
-          updateWidgetState('present', 'Auto-detected - Present');
+          const clientLabel = currentBooking?.clientName ? ` - ${currentBooking.clientName}` : '';
+          updateWidgetState('present', `Present${clientLabel}`);
           console.log('[FF-MEET] Join reported successfully!', response.booking?.clientName);
+        } else if (response?.landingPage || response?.markedAbsent) {
+          joinReported = false;
+          removeFallbackPopup();
+          updateWidgetState(
+            'idle',
+            'Open your real Meet link — landing page was marked absent on server.'
+          );
+          console.warn('[FF-MEET] Meet landing / absent:', response?.error);
         } else if (response?.noMatch) {
           console.log('[FF-MEET] No matching meeting found, will retry...');
           setTimeout(onCallDetected, 10000);
@@ -383,31 +550,35 @@
     if (!isInCall) return;
     isInCall = false;
 
-    const duration = scrapeMeetDuration() || getElapsedStr();
-    console.log('[FF-MEET] Call ended. Duration:', duration);
+    const duration = getElapsedStr();
+    const durationMs = callStartTime ? Date.now() - callStartTime : 0;
+    console.log('[FF-MEET] Call ended. Duration:', duration, `(${Math.round(durationMs / 60000)} min)`, 'Meet:', currentMeetLink || window.location.href);
 
-    // Fire beacon as redundant safety (in case chrome.runtime.sendMessage fails)
-    sendBeaconLeave();
+    notifyMeetingEnd('meet_call_ended');
 
-    // Also notify background via normal message passing
-    chrome.runtime.sendMessage({
-      type: 'MEET_CALL_ENDED',
-      url: window.location.href,
-      duration,
-      durationMs: callStartTime ? Date.now() - callStartTime : 0,
-    });
-
+    clearSession();
     removeFallbackPopup();
     updateWidgetState('idle', 'Call ended - ' + duration);
   }
 
   // ==================== Utility ====================
 
+  function isGoogleMeetLandingUrl(href) {
+    if (!href) return false;
+    return /meet\.google\.com\/landing(\/|\?|#|$)/i.test(String(href).trim());
+  }
+
   function extractMeetCode() {
-    const match = window.location.href.match(/meet\.google\.com\/([a-z]{3}-[a-z]{4}-[a-z]{3})/);
+    const href = window.location.href;
+    const match = href.match(/meet\.google\.com\/([a-z]{3}-[a-z]{4}-[a-z]{3})/);
     if (match) return match[1];
-    const match2 = window.location.href.match(/meet\.google\.com\/([a-zA-Z0-9_-]+)/);
-    return match2 ? match2[1].toLowerCase() : null;
+    const match2 = href.match(/meet\.google\.com\/([a-zA-Z0-9_-]+)/);
+    if (!match2) return null;
+    const seg = match2[1].toLowerCase();
+    if (seg === 'landing' || seg === 'new' || seg === 'about' || seg === 'getting-started') {
+      return null;
+    }
+    return seg;
   }
 
   // ==================== Widget position (draggable) ====================
@@ -668,6 +839,39 @@
         .ff-btn:disabled { background: #d1d5db; color: #6b7280; cursor: not-allowed; }
         .ff-btn.done { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; cursor: default; }
 
+        .ff-end-btn {
+          width: 100%; padding: 8px; margin-top: 6px;
+          background: #dc2626; color: white; border: none;
+          border-radius: 6px; font-size: 12px; font-weight: 600;
+          cursor: pointer; transition: background 0.2s;
+          display: none;
+        }
+        .ff-end-btn:hover { background: #b91c1c; }
+        .ff-end-btn:disabled { background: #d1d5db; color: #6b7280; cursor: not-allowed; }
+
+        .ff-ext-end {
+          display: none;
+          margin-top: 8px;
+          padding: 6px 14px;
+          background: #dc2626; color: white; border: none;
+          border-radius: 20px; font-size: 11px; font-weight: 600;
+          cursor: pointer; transition: background 0.2s;
+          box-shadow: 0 2px 8px rgba(220, 38, 38, 0.4);
+          white-space: nowrap;
+        }
+        .ff-ext-end:hover { background: #b91c1c; }
+        .ff-ext-end:disabled { background: #d1d5db; cursor: not-allowed; }
+
+        .ff-ext-dur {
+          display: none;
+          margin-top: 4px;
+          padding: 2px 10px;
+          background: rgba(0,0,0,0.7); color: #fff;
+          border-radius: 12px; font-size: 11px; font-weight: 700;
+          text-align: center;
+          font-variant-numeric: tabular-nums;
+        }
+
         .ff-empty { font-size: 12px; color: #9ca3af; text-align: center; padding: 8px 0; }
       </style>
 
@@ -675,6 +879,8 @@
         <div class="ff-pulse" id="ff-pulse"></div>
         <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
       </button>
+      <div class="ff-ext-dur" id="ff-ext-dur">0:00</div>
+      <button class="ff-ext-end" id="ff-ext-end">End Meet</button>
 
       <div class="ff-card" id="ff-card">
         <div class="ff-hdr">
@@ -687,13 +893,15 @@
             <span id="ff-status">Detecting call...</span>
           </div>
           <div class="ff-dur" id="ff-dur" style="display:none;">
-            Duration: <span id="ff-dur-val">0:00</span>
+            Duration: <span id="ff-dur-val" style="font-size:14px; font-weight:700;">0:00</span>
           </div>
+          <div class="ff-meet-link" id="ff-meet-link" style="display:none; font-size:9px; color:#9ca3af; margin-bottom:8px; word-break:break-all;"></div>
           <div class="ff-info" id="ff-info" style="display:none;">
             <strong id="ff-client"></strong>
           </div>
           <div id="ff-no-match" class="ff-empty">Scanning for matching meeting...</div>
           <button class="ff-btn" id="ff-btn" style="display:none;">Mark Present</button>
+          <button class="ff-end-btn" id="ff-end-btn">End Meet</button>
         </div>
       </div>
     `;
@@ -726,10 +934,54 @@
           } else {
             btn.disabled = false;
             btn.textContent = 'Retry - Mark Present';
+            if (response?.markedAbsent || response?.error) {
+              updateWidgetState('idle', response.error || 'Use the real Meet room link.');
+            }
           }
         }
       );
     });
+
+    // End Meet button — manually triggers leave event + beacon
+    document.getElementById('ff-end-btn').addEventListener('click', () => {
+      const endBtn = document.getElementById('ff-end-btn');
+      if (endBtn.disabled) return;
+
+      const duration = getElapsedStr();
+      const durationMs = callStartTime ? Date.now() - callStartTime : 0;
+      console.log('[FF-MEET] End Meet button clicked. Duration:', duration, `(${Math.round(durationMs / 60000)} min)`, 'Meet:', currentMeetLink || window.location.href);
+
+      endBtn.disabled = true;
+      endBtn.textContent = 'Ending...';
+
+      notifyMeetingEnd('meet_widget');
+
+      isInCall = false;
+      clearSession();
+      removeFallbackPopup();
+      updateWidgetState('idle', 'Call ended - ' + duration);
+
+      endBtn.textContent = 'Meet Ended';
+    });
+
+    // External End Meet button (always visible next to toggle when in-call)
+    document.getElementById('ff-ext-end').addEventListener('click', () => {
+      // Trigger the same logic as the card End Meet button
+      document.getElementById('ff-end-btn').click();
+    });
+  }
+
+  function endMeetAction() {
+    const duration = getElapsedStr();
+    const durationMs = callStartTime ? Date.now() - callStartTime : 0;
+    console.log('[FF-MEET] End Meet. Duration:', duration, `(${Math.round(durationMs / 60000)} min)`, 'Meet:', currentMeetLink || window.location.href);
+
+    notifyMeetingEnd('meet_widget');
+
+    isInCall = false;
+    clearSession();
+    removeFallbackPopup();
+    updateWidgetState('idle', 'Call ended - ' + duration);
   }
 
   function updateWidgetState(state, text) {
@@ -737,24 +989,69 @@
     const status = document.getElementById('ff-status');
     const toggle = document.getElementById('ff-toggle');
     const btn = document.getElementById('ff-btn');
+    const endBtn = document.getElementById('ff-end-btn');
+    const extEnd = document.getElementById('ff-ext-end');
+    const extDur = document.getElementById('ff-ext-dur');
+    const dur = document.getElementById('ff-dur');
+    const meetLinkEl = document.getElementById('ff-meet-link');
+    const noMatch = document.getElementById('ff-no-match');
 
     if (dot) dot.className = 'ff-dot ' + state;
     if (status) status.textContent = text;
 
-    if (state === 'present' && toggle) {
-      toggle.classList.add('marked');
+    // Toggle button styling
+    if (toggle) {
+      if (state === 'present') toggle.classList.add('marked');
+      else toggle.classList.remove('marked');
     }
+
+    // Mark Present button
     if (state === 'present' && btn) {
       btn.textContent = 'Marked Present';
       btn.classList.add('done');
       btn.disabled = true;
     }
 
+    // Show duration + meet link + End Meet when in-call or present
+    if (state === 'in-call' || state === 'present') {
+      if (dur) dur.style.display = 'block';
+      if (noMatch) noMatch.style.display = 'none';
+      if (meetLinkEl) {
+        meetLinkEl.style.display = 'block';
+        meetLinkEl.textContent = window.location.href;
+      }
+      // Card End Meet button
+      if (endBtn) {
+        endBtn.style.display = 'block';
+        endBtn.disabled = false;
+        endBtn.textContent = 'End Meet';
+      }
+      // External End Meet button + duration (always visible next to toggle)
+      if (extEnd) {
+        extEnd.style.display = 'block';
+        extEnd.disabled = false;
+        extEnd.textContent = 'End Meet';
+      }
+      if (extDur) {
+        extDur.style.display = 'block';
+        extDur.textContent = getElapsedStr();
+      }
+    } else if (state === 'idle') {
+      if (endBtn) endBtn.style.display = 'none';
+      if (extEnd) { extEnd.style.display = 'none'; }
+      if (extDur) { extDur.style.display = 'none'; }
+      if (meetLinkEl) meetLinkEl.style.display = 'none';
+    }
+
+    // Always remove fallback popup when marked present
+    if (state === 'present') {
+      removeFallbackPopup();
+    }
+
     // Show meeting info
     if (currentBooking) {
       const info = document.getElementById('ff-info');
       const client = document.getElementById('ff-client');
-      const noMatch = document.getElementById('ff-no-match');
       const btnEl = document.getElementById('ff-btn');
       if (info) info.style.display = 'block';
       if (client) client.textContent = 'Meeting: ' + currentBooking.clientName;
@@ -764,15 +1061,22 @@
   }
 
   function updateDuration() {
-    const dur = document.getElementById('ff-dur');
-    const durVal = document.getElementById('ff-dur-val');
-    if (!dur || !durVal) return;
-
     if (!isInCall && !callStartTime) return;
 
-    dur.style.display = 'block';
-    const scraped = scrapeMeetDuration();
-    durVal.textContent = scraped || getElapsedStr();
+    const elapsed = getElapsedStr();
+
+    // Card duration
+    const dur = document.getElementById('ff-dur');
+    const durVal = document.getElementById('ff-dur-val');
+    if (dur) dur.style.display = 'block';
+    if (durVal) durVal.textContent = elapsed;
+
+    // External duration (always visible next to toggle)
+    const extDur = document.getElementById('ff-ext-dur');
+    if (extDur) {
+      extDur.style.display = 'block';
+      extDur.textContent = elapsed;
+    }
   }
 
   // ==================== Communication ====================
@@ -780,14 +1084,25 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'MEET_BOOKING_INFO') {
       currentBooking = { bookingId: message.bookingId, clientName: message.clientName };
-      updateWidgetState(joinReported ? 'present' : 'in-call', joinReported ? 'Present' : 'Matched - waiting for call...');
+      const clientLabel = message.clientName ? ` - ${message.clientName}` : '';
+      if (joinReported) {
+        updateWidgetState('present', `Present${clientLabel}`);
+      } else if (isInCall) {
+        updateWidgetState('in-call', `In call${clientLabel}`);
+      } else {
+        updateWidgetState('detecting', `Matched: ${message.clientName}`);
+      }
       sendResponse({ success: true });
     }
 
     if (message.type === 'MEET_ATTENDANCE_CONFIRMED') {
       joinReported = true;
+      if (message.bookingId && message.clientName) {
+        currentBooking = { bookingId: message.bookingId, clientName: message.clientName };
+      }
       removeFallbackPopup();
-      updateWidgetState('present', 'Present - Attendance recorded');
+      const clientLabel = currentBooking?.clientName ? ` - ${currentBooking.clientName}` : '';
+      updateWidgetState('present', `Present${clientLabel}`);
       sendResponse({ success: true });
     }
 
@@ -805,9 +1120,18 @@
     // Transition: not in call -> in call
     if (nowInCall && !prevInCall) {
       console.log('[FF-MEET] Call joined!');
+      sessionEndRequestId = null;
       isInCall = true;
-      callStartTime = Date.now();
-      updateWidgetState('in-call', 'In call - reporting...');
+      if (!callStartTime) callStartTime = Date.now();
+      currentMeetLink = window.location.href;
+      saveSession(currentMeetLink, callStartTime);
+
+      // Show live timer and End Meet immediately
+      if (joinReported) {
+        updateWidgetState('present', 'Present');
+      } else {
+        updateWidgetState('in-call', 'In call');
+      }
 
       // Attach leave button interceptor
       attachLeaveButtonInterceptor();
@@ -838,11 +1162,29 @@
 
   // ==================== Init ====================
 
-  function init() {
+  async function init() {
+    if (isGoogleMeetLandingUrl(window.location.href)) {
+      console.log('[FF-MEET] Skipping widget on Meet landing page');
+      return;
+    }
+
     const code = extractMeetCode();
     if (!code || code.length < 3) return; // Not a real meet page
 
     console.log('[FF-MEET] Initializing on meet:', code);
+    currentMeetLink = window.location.href;
+
+    // Restore session from storage (survives page reload / extension restart)
+    const session = await restoreSession();
+    if (session && session.meetLink && session.meetLink.includes(code)) {
+      callStartTime = session.joinedAt;
+      currentMeetLink = session.meetLink;
+      if (session.bookingId) {
+        currentBooking = { bookingId: session.bookingId, clientName: '' };
+      }
+      console.log('[FF-MEET] Restored session from storage. Duration so far:', getElapsedStr());
+    }
+
     createWidget();
 
     // Get BDA auth info + cache token for sendBeacon
@@ -898,6 +1240,11 @@
 
     // FALLBACK: 10s poll as safety net (in case MutationObserver misses something)
     checkInterval = setInterval(tick, FALLBACK_POLL_INTERVAL_MS);
+
+    // Duration display updates every second for smooth timer
+    setInterval(() => {
+      if (isInCall || callStartTime) updateDuration();
+    }, 1000);
 
     // Initial check
     tick();

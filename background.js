@@ -6,6 +6,7 @@ const API = {
   MY_MEETINGS: API_URLS.MY_MEETINGS,
   REPORT_JOIN: API_URLS.REPORT_JOIN,
   REPORT_LEAVE: API_URLS.REPORT_LEAVE,
+  REPORT_END_EVENT: API_URLS.REPORT_END_EVENT,
   MARK_ABSENT: API_URLS.MARK_ABSENT,
   MANUAL_MARK: API_URLS.MANUAL_MARK,
 };
@@ -90,7 +91,10 @@ async function flushPendingRequests() {
     // Skip requests older than 3 hours
     if (Date.now() - req.queuedAt > 3 * 60 * 60 * 1000) continue;
 
-    const endpoint = req.type === 'join' ? API.REPORT_JOIN : API.REPORT_LEAVE;
+    let endpoint = API.REPORT_LEAVE;
+    if (req.type === 'join') endpoint = API.REPORT_JOIN;
+    else if (req.type === 'end_event') endpoint = API.REPORT_END_EVENT;
+
     const apiResult = await apiFetch(endpoint, {
       method: 'POST',
       keepalive: true,
@@ -100,7 +104,8 @@ async function flushPendingRequests() {
     if (!apiResult?.success) {
       remaining.push(req); // Keep for retry
     } else {
-      console.log(`[BDA-BG] Flushed pending ${req.type} for ${req.data.bookingId}`);
+      const id = req.data?.bookingId || req.data?.requestId || 'ok';
+      console.log(`[BDA-BG] Flushed pending ${req.type} for ${id}`);
     }
   }
 
@@ -171,7 +176,17 @@ function extractMeetCode(url) {
   if (match) return match[1];
   // Also match other formats
   const match2 = url.match(/meet\.google\.com\/([a-zA-Z0-9_-]+)/);
-  return match2 ? match2[1].toLowerCase() : null;
+  if (!match2) return null;
+  const seg = match2[1].toLowerCase();
+  if (seg === 'landing' || seg === 'new' || seg === 'about' || seg === 'getting-started') {
+    return null;
+  }
+  return seg;
+}
+
+function isGoogleMeetLandingUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  return /meet\.google\.com\/landing(\/|\?|#|$)/i.test(url.trim());
 }
 
 function doesMeetMatchBooking(tabMeetCode, booking) {
@@ -223,12 +238,12 @@ async function checkMeetings() {
   const now = getServerTime();
   const nowMs = now.getTime();
 
-  // Clean up old tracked entries (meetings older than 3 hours)
-  const threeHoursAgo = nowMs - 3 * 60 * 60 * 1000;
+  // Clean up old tracked entries (meetings older than 1 hour)
+  const oneHourAgo = nowMs - 1 * 60 * 60 * 1000;
   let cleanupNeeded = false;
   for (const bookingId of Object.keys(trackedMeetings)) {
     const tracked = trackedMeetings[bookingId];
-    if (tracked.trackedAt && tracked.trackedAt < threeHoursAgo) {
+    if (tracked.trackedAt && tracked.trackedAt < oneHourAgo) {
       delete trackedMeetings[bookingId];
       cleanupNeeded = true;
     }
@@ -247,6 +262,7 @@ async function checkMeetings() {
     meetTabs = await chrome.tabs.query({ url: 'https://meet.google.com/*' });
     // Filter out meet landing/home pages - only actual meeting tabs
     meetTabs = meetTabs.filter((t) => {
+      if (isGoogleMeetLandingUrl(t.url)) return false;
       const code = extractMeetCode(t.url);
       return code && code.length >= 3; // has a real meeting code
     });
@@ -316,7 +332,20 @@ async function checkMeetings() {
           body: JSON.stringify(joinData),
         });
 
-        if (result?.success) {
+        if (result?.markedAbsent) {
+          await setTracked(bookingId, {
+            reported: true,
+            leaveReported: true,
+            trackedAt: nowMs,
+          });
+          addEventLog({
+            type: 'absent',
+            bookingId,
+            clientName: meeting.clientName,
+          });
+          await fetchMeetings(true);
+          console.warn(`[BDA-BG] Meet landing URL for ${bookingId} — marked absent on server`);
+        } else if (result?.success) {
           await setTracked(bookingId, {
             meetCode: tabMeetCode,
             tabId: matchedTab.id,
@@ -345,6 +374,7 @@ async function checkMeetings() {
             chrome.tabs.sendMessage(matchedTab.id, {
               type: 'MEET_ATTENDANCE_CONFIRMED',
               bookingId,
+              clientName: meeting.clientName,
             }).catch(() => {});
           } catch {}
 
@@ -363,8 +393,8 @@ async function checkMeetings() {
       }
     }
 
-    // ---- 2-minute warning: BDA not in meet, send Discord reminder (once per booking, server + client dedupe) ----
-    if (nowMs >= startMs + 2 * 60 * 1000 && !isHandled(bookingId)) {
+    // ---- 60-second warning: BDA not in meet, send Discord reminder (once per booking, server + client dedupe) ----
+    if (nowMs >= startMs + 60 * 1000 && !isHandled(bookingId)) {
       const warnKey = `bda_warned_${bookingId}`;
       const warnData = await chrome.storage.local.get([warnKey]);
 
@@ -389,8 +419,8 @@ async function checkMeetings() {
       }
     }
 
-    // ---- 1-minute absent check popup (changed from 5 min) ----
-    if (nowMs >= startMs + 1 * 60 * 1000 && !isHandled(bookingId)) {
+    // ---- 60-second absent check popup ----
+    if (nowMs >= startMs + 60 * 1000 && !isHandled(bookingId)) {
       const notifKey = `bda_notified_${bookingId}`;
       const notifData = await chrome.storage.local.get([notifKey]);
 
@@ -491,6 +521,125 @@ async function reportLeave(bookingId) {
     }
   } finally {
     leaveReportInFlight.delete(bookingId);
+  }
+}
+
+function newEndRequestId() {
+  return `ff_end_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+}
+
+const finalizeEndInFlight = new Set();
+
+/** Single path for End Meet: closes session + immutable end-event row on server */
+async function finalizeMeetingEnd({
+  bookingId: explicitBookingId,
+  meetLink,
+  endSource,
+  requestId: incomingRequestId,
+  joinedAtMs,
+  tabId,
+  durationMs,
+}) {
+  await loadAuth();
+  if (!token) {
+    console.warn('[BDA-BG] finalizeMeetingEnd: no token');
+    return { success: false, error: 'Not authenticated' };
+  }
+
+  const requestId = incomingRequestId || newEndRequestId();
+  if (finalizeEndInFlight.has(requestId)) {
+    return { success: true, skipped: true };
+  }
+  finalizeEndInFlight.add(requestId);
+
+  try {
+    const leftAt = new Date().toISOString();
+
+    let bookingId = explicitBookingId || null;
+
+    await loadTrackedState();
+
+    if (!bookingId && tabId != null) {
+      for (const bid of Object.keys(trackedMeetings)) {
+        const t = trackedMeetings[bid];
+        if (t.tabId === tabId && t.reported && !t.leaveReported) {
+          bookingId = bid;
+          break;
+        }
+      }
+    }
+
+    let effectiveJoinedAtMs = joinedAtMs;
+    if (bookingId && effectiveJoinedAtMs == null) {
+      const t = trackedMeetings[bookingId];
+      if (t?.joinedAt) effectiveJoinedAtMs = t.joinedAt;
+    }
+
+    const joinedAtSnapshot =
+      effectiveJoinedAtMs != null
+        ? new Date(effectiveJoinedAtMs).toISOString()
+        : undefined;
+
+    if (!bookingId && meetLink) {
+      await fetchMeetings(true);
+      const code = extractMeetCode(meetLink);
+      const all = [...(meetings?.upcoming || []), ...(meetings?.previous || [])];
+      const m = all.find((b) => doesMeetMatchBooking(code, b));
+      if (m) bookingId = m.bookingId;
+    }
+
+    const body = {
+      requestId,
+      endSource,
+      leftAt,
+      ...(meetLink ? { meetLink } : {}),
+      ...(bookingId ? { bookingId } : {}),
+      ...(joinedAtSnapshot ? { joinedAtSnapshot } : {}),
+      ...(durationMs != null ? { durationMsSnapshot: durationMs } : {}),
+    };
+
+    const result = await apiFetch(API.REPORT_END_EVENT, {
+      method: 'POST',
+      keepalive: true,
+      body: JSON.stringify(body),
+    });
+
+    if (result?.success) {
+      const resolvedBooking = result.bookingId || bookingId || null;
+
+      if (resolvedBooking) {
+        await setTracked(resolvedBooking, {
+          leaveReported: true,
+          leftAt: Date.now(),
+        });
+      }
+
+      const allMeetings = [...(meetings?.upcoming || []), ...(meetings?.previous || [])];
+      const meeting = allMeetings.find((m) => m.bookingId === resolvedBooking);
+      const durationMin =
+        durationMs != null ? Math.round(durationMs / 60000) : undefined;
+      addEventLog({
+        type: 'leave',
+        bookingId: resolvedBooking,
+        clientName: meeting?.clientName || 'Meeting ended',
+        ...(durationMin != null ? { duration: `${durationMin} min` } : {}),
+      });
+
+      await fetchMeetings(true);
+      console.log(
+        `[BDA-BG] END EVENT ok requestId=${requestId} booking=${resolvedBooking}`
+      );
+      return result;
+    }
+
+    console.warn('[BDA-BG] REPORT_END_EVENT failed; queueing');
+    await queuePendingRequest('end_event', body);
+    if (bookingId) {
+      await setTracked(bookingId, { leaveReported: true, leftAt: Date.now() });
+    }
+    return result || { success: false };
+  } finally {
+    finalizeEndInFlight.delete(requestId);
   }
 }
 
@@ -730,6 +879,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       }
 
+      if (message.url && isGoogleMeetLandingUrl(message.url)) {
+        sendResponse({ booking: null, landingPage: true });
+        return;
+      }
+
       const allMeetings = [...(meetings.upcoming || []), ...(meetings.previous || [])];
       const now = getServerTime();
       const nowMs = now.getTime();
@@ -774,6 +928,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       await loadAuth();
       await loadTrackedState();
 
+      if (message.meetLink && isGoogleMeetLandingUrl(message.meetLink)) {
+        sendResponse({
+          success: false,
+          error: 'Open the real Google Meet room (not meet.google.com/landing).',
+        });
+        return;
+      }
+
       const joinData = {
         bookingId: message.bookingId,
         meetLink: message.meetLink,
@@ -784,6 +946,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         method: 'POST',
         body: JSON.stringify(joinData),
       });
+
+      if (result?.markedAbsent) {
+        await setTracked(message.bookingId, {
+          reported: true,
+          leaveReported: true,
+          trackedAt: Date.now(),
+        });
+        addEventLog({
+          type: 'absent',
+          bookingId: message.bookingId,
+          clientName: message.clientName || 'Manual via Meet',
+        });
+        await fetchMeetings(true);
+        sendResponse({
+          success: false,
+          markedAbsent: true,
+          error: result.message || 'Meet landing URL — marked absent.',
+        });
+        return;
+      }
 
       if (result?.success) {
         await setTracked(message.bookingId, {
@@ -881,6 +1063,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         body: JSON.stringify(joinData),
       });
 
+      if (result?.markedAbsent) {
+        await setTracked(matched.bookingId, {
+          reported: true,
+          leaveReported: true,
+          trackedAt: nowMs,
+        });
+        addEventLog({
+          type: 'absent',
+          bookingId: matched.bookingId,
+          clientName: matched.clientName,
+        });
+        await fetchMeetings(true);
+        sendResponse({
+          success: false,
+          landingPage: true,
+          markedAbsent: true,
+          error: result.message || 'Meet landing URL — not a real room; marked absent.',
+        });
+        return;
+      }
+
       if (result?.success) {
         await setTracked(matched.bookingId, {
           meetCode: tabMeetCode,
@@ -917,19 +1120,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'MEET_CALL_ENDED') {
-    // Meet content script detected call ended - report leave with duration
     (async () => {
-      await loadTrackedState();
-      // Find which booking was tracked on this tab
       const tabId = sender.tab?.id;
-      for (const bookingId of Object.keys(trackedMeetings)) {
-        const tracked = trackedMeetings[bookingId];
-        if (tracked.tabId === tabId && tracked.reported && !tracked.leaveReported) {
-          await reportLeave(bookingId);
-          break;
-        }
+      const result = await finalizeMeetingEnd({
+        bookingId: message.bookingId || null,
+        meetLink: message.url,
+        endSource: message.endSource || 'meet_call_ended',
+        requestId: message.requestId,
+        joinedAtMs: message.joinedAtMs,
+        tabId,
+        durationMs: message.durationMs,
+      });
+      sendResponse(result || { success: true });
+    })();
+    return true;
+  }
+
+  if (message.type === 'PANEL_END_MEET') {
+    (async () => {
+      await loadAuth();
+      if (!token) {
+        sendResponse({ success: false, error: 'Not authenticated' });
+        return;
       }
-      sendResponse({ success: true });
+
+      let meetLink = message.meetLink;
+      if (!meetLink && message.bookingId) {
+        await fetchMeetings(true);
+        const allMeetings = [...(meetings?.upcoming || []), ...(meetings?.previous || [])];
+        const m = allMeetings.find((x) => x.bookingId === message.bookingId);
+        meetLink = m?.googleMeetUrl || m?.calendlyMeetLink || null;
+      }
+
+      const result = await finalizeMeetingEnd({
+        bookingId: message.bookingId,
+        meetLink: meetLink || undefined,
+        endSource: 'panel',
+        requestId: message.requestId,
+        joinedAtMs: message.joinedAtMs,
+        tabId: null,
+        durationMs: message.durationMs,
+      });
+      sendResponse(result || { success: false });
     })();
     return true;
   }
@@ -938,9 +1170,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       await loadAuth();
       await loadTrackedState();
+
+      // Try to find meetLink from meetings data
+      const allMeetings = [...(meetings?.upcoming || []), ...(meetings?.previous || [])];
+      const meetingData = allMeetings.find(m => m.bookingId === message.bookingId);
+      const meetLink = meetingData?.googleMeetUrl || meetingData?.calendlyMeetLink || null;
+
       const result = await apiFetch(API.MANUAL_MARK, {
         method: 'POST',
-        body: JSON.stringify({ bookingId: message.bookingId }),
+        body: JSON.stringify({ bookingId: message.bookingId, meetLink }),
       });
       if (result?.success) {
         await setTracked(message.bookingId, { reported: true, leaveReported: false, trackedAt: Date.now() });

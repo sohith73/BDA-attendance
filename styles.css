@@ -388,8 +388,9 @@ body {
 
 .meeting-meta {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 8px;
 }
 
@@ -447,6 +448,31 @@ body {
 }
 
 .btn-mark:disabled {
+  background: var(--ff-gray-300);
+  color: var(--ff-gray-500);
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-end {
+  padding: 5px 12px;
+  margin-left: 6px;
+  background: #dc2626;
+  color: white;
+  border: none;
+  border-radius: var(--ff-radius-sm);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--ff-transition);
+}
+
+.btn-end:hover {
+  background: #b91c1c;
+  transform: translateY(-1px);
+}
+
+.btn-end:disabled {
   background: var(--ff-gray-300);
   color: var(--ff-gray-500);
   cursor: not-allowed;

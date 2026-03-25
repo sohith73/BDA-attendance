@@ -60,6 +60,26 @@
     </form>
   </div>
 
+  <!-- ==================== Setup Screen - Step 3: Name ==================== -->
+  <div id="name-screen" class="setup-container" style="display: none;">
+    <div class="setup-brand">
+      <img src="icons/icon128.png" alt="FlashFire" class="logo">
+      <h1>Welcome!</h1>
+      <p>Please enter your display name</p>
+    </div>
+
+    <form id="name-form" class="setup-form">
+      <div class="form-group">
+        <label for="bda-name-input">Your Name</label>
+        <input type="text" id="bda-name-input" placeholder="e.g., Sohith Kumar" required minlength="2" maxlength="100">
+      </div>
+      <button type="submit" id="name-btn" class="btn-primary">
+        Continue
+      </button>
+      <div id="name-error" class="form-error" style="display: none;"></div>
+    </form>
+  </div>
+
   <!-- ==================== Dashboard ==================== -->
   <div id="dashboard-screen" class="dashboard-container" style="display: none;">
     <!-- Header -->

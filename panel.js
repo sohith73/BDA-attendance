@@ -24,6 +24,13 @@ const otpEmailDisplay = document.getElementById('otp-email-display');
 const changeEmailBtn = document.getElementById('change-email-btn');
 const resendOtpBtn = document.getElementById('resend-otp-btn');
 
+// Name step
+const nameScreen = document.getElementById('name-screen');
+const nameForm = document.getElementById('name-form');
+const nameBtn = document.getElementById('name-btn');
+const nameError = document.getElementById('name-error');
+const bdaNameInput = document.getElementById('bda-name-input');
+
 // Dashboard
 const bdaDisplayName = document.getElementById('bda-display-name');
 const bdaDisplayEmail = document.getElementById('bda-display-email');
@@ -53,7 +60,14 @@ async function init() {
   if (auth?.token) {
     token = auth.token;
     bdaInfo = auth.bdaInfo;
-    showDashboard();
+    // Check if name is a placeholder (email local-part) — prompt for real name
+    const emailLocal = bdaInfo?.email?.split('@')[0];
+    const needsName = !bdaInfo?.name || bdaInfo.name === emailLocal;
+    if (needsName) {
+      showNameStep();
+    } else {
+      showDashboard();
+    }
   } else {
     showEmailStep();
   }
@@ -64,11 +78,66 @@ async function init() {
 function showEmailStep() {
   setupScreen.style.display = 'flex';
   otpScreen.style.display = 'none';
+  nameScreen.style.display = 'none';
   dashboardScreen.style.display = 'none';
   disconnectSSE();
   emailError.style.display = 'none';
   emailInfo.style.display = 'none';
 }
+
+// ==================== Auth Flow - Step 3: Name ====================
+
+function showNameStep() {
+  setupScreen.style.display = 'none';
+  otpScreen.style.display = 'none';
+  nameScreen.style.display = 'flex';
+  dashboardScreen.style.display = 'none';
+  nameError.style.display = 'none';
+  bdaNameInput.value = '';
+  bdaNameInput.focus();
+}
+
+nameForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = bdaNameInput.value.trim();
+  if (!name || name.length < 2) return;
+
+  nameBtn.disabled = true;
+  nameBtn.innerHTML = '<span class="spinner"></span> Saving...';
+  nameError.style.display = 'none';
+
+  try {
+    const res = await fetch(API_URLS.UPDATE_NAME, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ name }),
+    });
+
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Failed to update name');
+
+    // Update token and bdaInfo with new name
+    token = data.token;
+    bdaInfo = data.bda;
+
+    await sendMessage({
+      type: 'SET_AUTH',
+      token: data.token,
+      bdaInfo: data.bda,
+    });
+
+    showDashboard();
+  } catch (err) {
+    nameError.textContent = err.message;
+    nameError.style.display = 'block';
+  } finally {
+    nameBtn.disabled = false;
+    nameBtn.innerHTML = 'Continue';
+  }
+});
 
 emailForm.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -113,6 +182,7 @@ async function requestOtp(email) {
 function showOtpStep() {
   setupScreen.style.display = 'none';
   otpScreen.style.display = 'flex';
+  nameScreen.style.display = 'none';
   dashboardScreen.style.display = 'none';
   otpEmailDisplay.textContent = pendingEmail;
   otpInput.value = '';
@@ -161,7 +231,13 @@ otpForm.addEventListener('submit', async (e) => {
     });
 
     pendingEmail = null;
-    showDashboard();
+
+    // Show name prompt if needed, otherwise go to dashboard
+    if (data.needsName) {
+      showNameStep();
+    } else {
+      showDashboard();
+    }
   } catch (err) {
     otpError.textContent = err.message;
     otpError.style.display = 'block';
@@ -219,6 +295,7 @@ resendOtpBtn.addEventListener('click', async () => {
 function showDashboard() {
   setupScreen.style.display = 'none';
   otpScreen.style.display = 'none';
+  nameScreen.style.display = 'none';
   dashboardScreen.style.display = 'flex';
 
   if (bdaInfo) {
@@ -260,9 +337,14 @@ async function loadMeetings(force = false) {
 function renderMeetings() {
   if (!meetings) return;
 
-  // Upcoming
-  if (meetings.upcoming && meetings.upcoming.length > 0) {
-    upcomingContainer.innerHTML = meetings.upcoming
+  // Upcoming — show only next 5 from current time
+  const now = new Date();
+  const upcomingFiltered = (meetings.upcoming || [])
+    .filter((m) => new Date(m.scheduledStart) >= new Date(now.getTime() - 30 * 60 * 1000)) // include meetings started up to 30min ago
+    .slice(0, 5);
+
+  if (upcomingFiltered.length > 0) {
+    upcomingContainer.innerHTML = upcomingFiltered
       .map((m) => renderMeetingCard(m, 'upcoming'))
       .join('');
   } else {
@@ -273,9 +355,10 @@ function renderMeetings() {
       </div>`;
   }
 
-  // Previous
-  if (meetings.previous && meetings.previous.length > 0) {
-    previousContainer.innerHTML = meetings.previous
+  // Previous — show only last 5
+  const previousFiltered = (meetings.previous || []).slice(-5);
+  if (previousFiltered.length > 0) {
+    previousContainer.innerHTML = previousFiltered
       .map((m) => renderMeetingCard(m, 'previous'))
       .join('');
   } else {
@@ -288,6 +371,9 @@ function renderMeetings() {
   // Attach event listeners for manual mark buttons
   document.querySelectorAll('.btn-mark').forEach((btn) => {
     btn.addEventListener('click', handleManualMark);
+  });
+  document.querySelectorAll('.btn-end').forEach((btn) => {
+    btn.addEventListener('click', handlePanelEndMeet);
   });
 }
 
@@ -332,6 +418,16 @@ function renderMeetingCard(meeting, context) {
   // Can mark manually?
   const canMark = !meeting.attendance && now >= start && now <= new Date(start.getTime() + 2 * 60 * 60 * 1000);
 
+  const inLiveWindow =
+    now >= new Date(start.getTime() - 5 * 60 * 1000) &&
+    now <= new Date(start.getTime() + 3 * 60 * 60 * 1000);
+  const hasRecorded =
+    meeting.attendance && ['present', 'manual'].includes(meeting.attendance.status);
+  const canEnd = Boolean(hasRecorded && inLiveWindow);
+
+  const meetUrl = meeting.googleMeetUrl || meeting.calendlyMeetLink || '';
+  const meetAttr = meetUrl ? encodeURIComponent(meetUrl) : '';
+
   const timeStr = formatDateTime(start);
 
   const claimedByStr = meeting.claimedBy
@@ -347,7 +443,12 @@ function renderMeetingCard(meeting, context) {
         <span class="meeting-badge ${badgeClass}">${badgeText}</span>
         ${
           canMark
-            ? `<button class="btn-mark" data-booking-id="${meeting.bookingId}" data-client-name="${escapeHtml(meeting.clientName)}">Mark Present</button>`
+            ? `<button type="button" class="btn-mark" data-booking-id="${meeting.bookingId}" data-client-name="${escapeHtml(meeting.clientName)}">Mark Present</button>`
+            : ''
+        }
+        ${
+          canEnd
+            ? `<button type="button" class="btn-end" data-booking-id="${meeting.bookingId}" data-meet-link="${meetAttr}">End Meet</button>`
             : ''
         }
       </div>
@@ -374,6 +475,40 @@ async function handleManualMark(e) {
     btn.textContent = result?.error || 'Failed';
     setTimeout(() => {
       btn.textContent = 'Mark Present';
+      btn.disabled = false;
+    }, 2000);
+  }
+}
+
+function newPanelEndRequestId() {
+  return `ff_panel_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
+}
+
+async function handlePanelEndMeet(e) {
+  const btn = e.target.closest('.btn-end');
+  if (!btn) return;
+
+  const bookingId = btn.dataset.bookingId;
+  const meetAttr = btn.dataset.meetLink || '';
+  const meetLink = meetAttr ? decodeURIComponent(meetAttr) : '';
+
+  btn.disabled = true;
+  btn.textContent = 'Ending...';
+
+  const result = await sendMessage({
+    type: 'PANEL_END_MEET',
+    bookingId,
+    meetLink: meetLink || undefined,
+    requestId: newPanelEndRequestId(),
+  });
+
+  if (result?.success) {
+    await loadMeetings(true);
+    await loadEventLog();
+  } else {
+    btn.textContent = result?.error || 'Failed';
+    setTimeout(() => {
+      btn.textContent = 'End Meet';
       btn.disabled = false;
     }, 2000);
   }
@@ -434,6 +569,12 @@ function connectSSE() {
   const url = `${API_URLS.SSE}?token=${encodeURIComponent(token)}`;
   eventSource = new EventSource(url);
 
+  // Fallback: onopen fires when HTTP connection succeeds (even before named events)
+  eventSource.onopen = () => {
+    setConnectionStatus('connected');
+    sseReconnectDelay = 1000;
+  };
+
   eventSource.addEventListener('connected', () => {
     setConnectionStatus('connected');
     sseReconnectDelay = 1000;
@@ -452,7 +593,8 @@ function connectSSE() {
     loadEventLog();
   });
 
-  eventSource.onerror = () => {
+  eventSource.onerror = (e) => {
+    console.error('[SSE] Connection error:', e);
     setConnectionStatus('disconnected');
     disconnectSSE();
 
