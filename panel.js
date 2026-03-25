@@ -222,8 +222,10 @@ function showDashboard() {
   dashboardScreen.style.display = 'flex';
 
   if (bdaInfo) {
-    bdaDisplayName.textContent = bdaInfo.name;
-    bdaDisplayEmail.textContent = bdaInfo.email;
+    const displayName =
+      bdaInfo.name && String(bdaInfo.name).trim() ? String(bdaInfo.name).trim() : bdaInfo.email || '';
+    bdaDisplayName.textContent = displayName;
+    bdaDisplayEmail.textContent = bdaInfo.email || '';
   }
 
   loadMeetings();

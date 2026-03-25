@@ -11,6 +11,7 @@ export const API_ENDPOINTS = {
   REPORT_LEAVE: '/api/bda-attendance/report-leave',
   MANUAL_MARK: '/api/bda-attendance/manual-mark',
   MARK_ABSENT: '/api/bda-attendance/mark-absent',
+  BEACON_LEAVE: '/api/bda-attendance/beacon-leave',
   SSE: '/api/bda-attendance/sse'
 };
 
@@ -23,5 +24,6 @@ export const API_URLS = {
   REPORT_LEAVE: `${API_BASE_URL}${API_ENDPOINTS.REPORT_LEAVE}`,
   MANUAL_MARK: `${API_BASE_URL}${API_ENDPOINTS.MANUAL_MARK}`,
   MARK_ABSENT: `${API_BASE_URL}${API_ENDPOINTS.MARK_ABSENT}`,
+  BEACON_LEAVE: `${API_BASE_URL}${API_ENDPOINTS.BEACON_LEAVE}`,
   SSE: `${API_BASE_URL}${API_ENDPOINTS.SSE}`
 };

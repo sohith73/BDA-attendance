@@ -21,6 +21,10 @@ const MEETINGS_CACHE_MS = 60 * 1000; // 1 minute - refresh often for accurate de
 // Runtime map rebuilt from chrome.storage.local on each wake
 let trackedMeetings = {};
 
+const warnAbsentInFlight = new Set();
+
+const leaveReportInFlight = new Set();
+
 // ==================== Storage Helpers ====================
 
 async function loadTrackedState() {
@@ -35,11 +39,72 @@ async function saveTrackedState() {
 async function setTracked(bookingId, state) {
   trackedMeetings[bookingId] = { ...(trackedMeetings[bookingId] || {}), ...state };
   await saveTrackedState();
+
+  if (state.reported && !state.leaveReported) {
+    await startKeepalive();
+  } else {
+    await stopKeepaliveIfIdle();
+  }
 }
 
 function isHandled(bookingId) {
   const t = trackedMeetings[bookingId];
   return t && t.reported;
+}
+
+
+function hasActiveTracking() {
+  return Object.values(trackedMeetings).some((t) => t.reported && !t.leaveReported);
+}
+
+async function startKeepalive() {
+  const existing = await chrome.alarms.get('keepalive');
+  if (!existing) {
+    chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); // ~24 seconds
+    console.log('[BDA-BG] Keepalive alarm started (active tracking in progress)');
+  }
+}
+
+async function stopKeepaliveIfIdle() {
+  if (!hasActiveTracking()) {
+    chrome.alarms.clear('keepalive');
+  }
+}
+
+// ==================== Pending Request Queue (network failure resilience) ====================
+
+async function queuePendingRequest(type, data) {
+  const result = await chrome.storage.local.get(['bda_pending_requests']);
+  const queue = result.bda_pending_requests || [];
+  queue.push({ type, data, queuedAt: Date.now() });
+  await chrome.storage.local.set({ bda_pending_requests: queue.slice(-20) }); // Keep last 20
+}
+
+async function flushPendingRequests() {
+  const result = await chrome.storage.local.get(['bda_pending_requests']);
+  const queue = result.bda_pending_requests || [];
+  if (queue.length === 0) return;
+
+  const remaining = [];
+  for (const req of queue) {
+    // Skip requests older than 3 hours
+    if (Date.now() - req.queuedAt > 3 * 60 * 60 * 1000) continue;
+
+    const endpoint = req.type === 'join' ? API.REPORT_JOIN : API.REPORT_LEAVE;
+    const apiResult = await apiFetch(endpoint, {
+      method: 'POST',
+      keepalive: true,
+      body: JSON.stringify(req.data),
+    });
+
+    if (!apiResult?.success) {
+      remaining.push(req); // Keep for retry
+    } else {
+      console.log(`[BDA-BG] Flushed pending ${req.type} for ${req.data.bookingId}`);
+    }
+  }
+
+  await chrome.storage.local.set({ bda_pending_requests: remaining });
 }
 
 // ==================== Auth ====================
@@ -63,13 +128,15 @@ async function loadAuth() {
 
 async function apiFetch(url, options = {}) {
   if (!token) return null;
+  const { keepalive, ...fetchOpts } = options;
   try {
     const res = await fetch(url, {
-      ...options,
+      ...fetchOpts,
+      ...(keepalive === true ? { keepalive: true } : {}),
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
-        ...(options.headers || {}),
+        ...(fetchOpts.headers || {}),
       },
     });
     if (!res.ok) {
@@ -296,22 +363,29 @@ async function checkMeetings() {
       }
     }
 
-    // ---- 2-minute warning: BDA not in meet, send Discord reminder ----
+    // ---- 2-minute warning: BDA not in meet, send Discord reminder (once per booking, server + client dedupe) ----
     if (nowMs >= startMs + 2 * 60 * 1000 && !isHandled(bookingId)) {
       const warnKey = `bda_warned_${bookingId}`;
       const warnData = await chrome.storage.local.get([warnKey]);
 
-      if (!warnData[warnKey]) {
-        await chrome.storage.local.set({ [warnKey]: Date.now() });
+      if (!warnData[warnKey] && !warnAbsentInFlight.has(bookingId)) {
+        warnAbsentInFlight.add(bookingId);
+        try {
+          const warnResult = await apiFetch(API.REPORT_JOIN.replace('/report-join', '/warn-absent'), {
+            method: 'POST',
+            body: JSON.stringify({ bookingId }),
+          }).catch(() => null);
 
-        // Send warning to present webhook
-        const warnResult = await apiFetch(API.REPORT_JOIN.replace('/report-join', '/warn-absent'), {
-          method: 'POST',
-          body: JSON.stringify({ bookingId }),
-        }).catch(() => null);
-
-        // If no special endpoint, we'll handle this in the absent check below
-        console.log(`[BDA-BG] 2-min warning for ${bookingId}`);
+          if (warnResult?.success) {
+            await chrome.storage.local.set({ [warnKey]: Date.now() });
+            console.log(`[BDA-BG] 2-min warn-absent sent for ${bookingId}`);
+          } else {
+            warnAbsentInFlight.delete(bookingId);
+            console.warn(`[BDA-BG] warn-absent not confirmed for ${bookingId}, will retry`);
+          }
+        } catch {
+          warnAbsentInFlight.delete(bookingId);
+        }
       }
     }
 
@@ -363,40 +437,60 @@ async function checkMeetings() {
 // ==================== Leave Reporting ====================
 
 async function reportLeave(bookingId) {
+  await loadTrackedState();
+
   const tracked = trackedMeetings[bookingId];
-  if (!tracked || tracked.leaveReported) return;
+  if (!tracked || tracked.leaveReported || leaveReportInFlight.has(bookingId)) return;
+
+  leaveReportInFlight.add(bookingId);
 
   const leftAt = new Date();
-  await setTracked(bookingId, { leaveReported: true, leftAt: leftAt.getTime() });
-
-  // Calculate duration from tracked joinedAt
   let durationMs = 0;
   if (tracked.joinedAt) {
     durationMs = leftAt.getTime() - tracked.joinedAt;
   }
 
-  const result = await apiFetch(API.REPORT_LEAVE, {
-    method: 'POST',
-    body: JSON.stringify({
-      bookingId,
-      leftAt: leftAt.toISOString(),
-    }),
-  });
-
-  if (result?.success) {
-    const allMeetings = [...(meetings?.upcoming || []), ...(meetings?.previous || [])];
-    const meeting = allMeetings.find((m) => m.bookingId === bookingId);
-    const durationMin = Math.round(durationMs / 60000);
-
-    addEventLog({
-      type: 'leave',
-      bookingId,
-      clientName: meeting?.clientName || 'Unknown',
-      duration: `${durationMin} min`,
+  try {
+    await loadAuth();
+    const result = await apiFetch(API.REPORT_LEAVE, {
+      method: 'POST',
+      keepalive: true,
+      body: JSON.stringify({
+        bookingId,
+        leftAt: leftAt.toISOString(),
+        durationMs: durationMs || undefined,
+      }),
     });
 
-    await fetchMeetings(true);
-    console.log(`[BDA-BG] LEAVE reported for ${bookingId}, duration: ${durationMin} min`);
+    if (result?.success) {
+      await setTracked(bookingId, { leaveReported: true, leftAt: leftAt.getTime() });
+
+      const allMeetings = [...(meetings?.upcoming || []), ...(meetings?.previous || [])];
+      const meeting = allMeetings.find((m) => m.bookingId === bookingId);
+      const durationMin = Math.round(durationMs / 60000);
+
+      addEventLog({
+        type: 'leave',
+        bookingId,
+        clientName: meeting?.clientName || 'Unknown',
+        duration: `${durationMin} min`,
+      });
+
+      await fetchMeetings(true);
+      console.log(`[BDA-BG] LEAVE reported for ${bookingId}, duration: ${durationMin} min`);
+    } else {
+      console.warn(`[BDA-BG] LEAVE API failed for ${bookingId}; queuing for retry`);
+      // Queue for retry on next checkMeetings cycle
+      await queuePendingRequest('leave', {
+        bookingId,
+        leftAt: leftAt.toISOString(),
+        durationMs: durationMs || undefined,
+      });
+      // Still mark as leaveReported locally to prevent duplicate attempts
+      await setTracked(bookingId, { leaveReported: true, leftAt: leftAt.getTime() });
+    }
+  } finally {
+    leaveReportInFlight.delete(bookingId);
   }
 }
 
@@ -405,6 +499,50 @@ async function reportLeave(bookingId) {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'check-meetings') {
     await checkMeetings();
+    // Also flush any pending requests from network failures
+    await loadAuth();
+    if (token) await flushPendingRequests();
+    return;
+  }
+
+  // Keepalive: check tab existence for all active-tracked meetings every ~24s
+  if (alarm.name === 'keepalive') {
+    await loadTrackedState();
+    let anyActive = false;
+
+    for (const bookingId of Object.keys(trackedMeetings)) {
+      const tracked = trackedMeetings[bookingId];
+      if (!tracked.reported || tracked.leaveReported) continue;
+      anyActive = true;
+
+      // Save lastAliveAt for crash recovery
+      tracked.lastAliveAt = Date.now();
+
+      // Verify tab still exists and is on Meet
+      if (tracked.tabId) {
+        try {
+          const tab = await chrome.tabs.get(tracked.tabId).catch(() => null);
+          if (!tab || !tab.url?.includes('meet.google.com')) {
+            console.log(`[BDA-BG] Keepalive: tab ${tracked.tabId} gone, reporting leave for ${bookingId}`);
+            await saveTrackedState(); // Save lastAliveAt before reporting
+            await reportLeave(bookingId);
+            continue;
+          }
+        } catch {
+          console.log(`[BDA-BG] Keepalive: tab ${tracked.tabId} error, reporting leave for ${bookingId}`);
+          await saveTrackedState();
+          await reportLeave(bookingId);
+          continue;
+        }
+      }
+    }
+
+    await saveTrackedState(); // Persist lastAliveAt updates
+
+    if (!anyActive) {
+      chrome.alarms.clear('keepalive');
+      console.log('[BDA-BG] Keepalive: no active tracking, alarm cleared');
+    }
     return;
   }
 
@@ -549,6 +687,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     bdaInfo = null;
     meetings = null;
     trackedMeetings = {};
+    warnAbsentInFlight.clear();
+    leaveReportInFlight.clear();
     chrome.storage.local.get(null, (allData) => {
       const keysToRemove = Object.keys(allData).filter(
         (k) => k.startsWith('bda_') || k.startsWith('bda_notified_') || k.startsWith('bda_warned_')
@@ -830,6 +970,54 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(async () => {
   chrome.alarms.create('check-meetings', { periodInMinutes: 1 });
+
+  // Recovery: check for tracked meetings that were never left (Chrome crash / force close)
+  await loadAuth();
+  await loadTrackedState();
+
+  for (const bookingId of Object.keys(trackedMeetings)) {
+    const tracked = trackedMeetings[bookingId];
+    if (tracked.reported && !tracked.leaveReported) {
+      // Use lastAliveAt for more accurate duration (instead of Date.now() which could be hours later)
+      const recoveryLeftAt = tracked.lastAliveAt ? new Date(tracked.lastAliveAt) : new Date();
+      let durationMs = 0;
+      if (tracked.joinedAt) {
+        durationMs = recoveryLeftAt.getTime() - tracked.joinedAt;
+      }
+
+      console.log(`[BDA-BG] RECOVERY: reporting leave for ${bookingId} (lastAliveAt: ${recoveryLeftAt.toISOString()}, duration: ${Math.round(durationMs / 60000)} min)`);
+
+      if (token) {
+        const result = await apiFetch(API.REPORT_LEAVE, {
+          method: 'POST',
+          keepalive: true,
+          body: JSON.stringify({
+            bookingId,
+            leftAt: recoveryLeftAt.toISOString(),
+            durationMs: durationMs || undefined,
+          }),
+        });
+
+        if (result?.success) {
+          await setTracked(bookingId, { leaveReported: true, leftAt: recoveryLeftAt.getTime() });
+          addEventLog({
+            type: 'leave',
+            bookingId,
+            clientName: 'Unknown (recovered after restart)',
+            duration: `${Math.round(durationMs / 60000)} min`,
+          });
+        } else {
+          // Queue for retry
+          await queuePendingRequest('leave', {
+            bookingId,
+            leftAt: recoveryLeftAt.toISOString(),
+            durationMs: durationMs || undefined,
+          });
+        }
+      }
+    }
+  }
+
   await checkMeetings();
 });
 
@@ -838,6 +1026,13 @@ chrome.runtime.onStartup.addListener(async () => {
   const hasAuth = await loadAuth();
   if (hasAuth) {
     chrome.alarms.create('check-meetings', { periodInMinutes: 1 });
+
+    // Restart keepalive if there are active tracked meetings from previous session
+    await loadTrackedState();
+    if (hasActiveTracking()) {
+      await startKeepalive();
+    }
+
     await checkMeetings();
   }
 })();

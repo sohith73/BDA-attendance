@@ -1,10 +1,17 @@
 // ==================== FlashFire BDA Attendance - Google Meet Content Script ====================
 // Injected ONLY into meet.google.com/* pages
 // PRIMARY auto-detection: detects when BDA joins a call and immediately reports to background
+// Uses MutationObserver for near-instant join/leave detection + sendBeacon for reliable leave reporting
 
 (function () {
   if (window.__ffMeetContentInjected) return;
   window.__ffMeetContentInjected = true;
+
+  // ==================== Constants ====================
+
+  const BEACON_LEAVE_URL = 'https://flashfire-backend-9wv0.onrender.com/api/bda-attendance/beacon-leave';
+  const FALLBACK_POPUP_DELAY_MS = 30000; // Show fallback popup after 30s if auto-attendance fails
+  const FALLBACK_POLL_INTERVAL_MS = 10000; // 10s safety-net poll (backup for MutationObserver)
 
   // ==================== State ====================
 
@@ -16,16 +23,17 @@
   let widget = null;
   let bdaInfo = null;
   let authChecked = false;
+  let storedToken = null; // Cached for sendBeacon (can't set auth headers)
+  let fallbackPopupTimeout = null;
+  let beaconSent = false; // Prevent duplicate beacons per session
 
   const FF_WIDGET_POS_KEY = 'ffMeetWidgetPos';
   const DRAG_THRESHOLD_PX = 8;
-  let widgetDrag = null; // { startX, startY, startLeft, startTop, pointerId, togglePointer, dragging }
+  let widgetDrag = null;
 
   // ==================== Call State Detection ====================
 
   function detectInCall() {
-    // Multiple strategies to detect if BDA is in an active call
-
     // Strategy 1: "Leave call" button exists (most reliable)
     const leaveBtn =
       document.querySelector('[aria-label="Leave call"]') ||
@@ -53,14 +61,62 @@
     return false;
   }
 
+  // ==================== sendBeacon Leave (fire-and-forget) ====================
+
+  function sendBeaconLeave() {
+    if (beaconSent || !currentBooking?.bookingId || !storedToken) return;
+    beaconSent = true;
+
+    try {
+      const blob = new Blob(
+        [
+          JSON.stringify({
+            bookingId: currentBooking.bookingId,
+            leftAt: new Date().toISOString(),
+            token: storedToken,
+            source: 'beacon',
+          }),
+        ],
+        { type: 'application/json' }
+      );
+      navigator.sendBeacon(BEACON_LEAVE_URL, blob);
+      console.log('[FF-MEET] Beacon leave sent for', currentBooking.bookingId);
+    } catch (err) {
+      console.warn('[FF-MEET] sendBeacon failed:', err.message);
+      beaconSent = false; // Allow retry
+    }
+  }
+
+  // ==================== Leave Button Click Interceptor ====================
+
+  function attachLeaveButtonInterceptor() {
+    const selectors = [
+      '[aria-label="Leave call"]',
+      '[aria-label="leave call"]',
+      '[data-tooltip="Leave call"]',
+      'button[jsname="CQylAd"]',
+    ];
+
+    for (const sel of selectors) {
+      const btn = document.querySelector(sel);
+      if (btn && !btn.__ffIntercepted) {
+        btn.addEventListener(
+          'click',
+          () => {
+            console.log('[FF-MEET] Leave button clicked — sending beacon');
+            sendBeaconLeave();
+          },
+          { capture: true, once: true }
+        );
+        btn.__ffIntercepted = true;
+      }
+    }
+  }
+
   // ==================== Duration Scraping ====================
 
   function scrapeMeetDuration() {
-    const selectors = [
-      '[data-call-duration]',
-      '.vpMJed',
-      '.r6xAKc',
-    ];
+    const selectors = ['[data-call-duration]', '.vpMJed', '.r6xAKc'];
 
     for (const sel of selectors) {
       try {
@@ -90,14 +146,207 @@
     return `${mins}:${String(secs).padStart(2, '0')}`;
   }
 
+  // ==================== Fallback In-Page Popup ====================
+
+  function showFallbackPopup() {
+    if (document.getElementById('ff-fallback-popup')) return;
+
+    const hasBooking = !!currentBooking;
+    const clientName = currentBooking?.clientName || '';
+
+    const popup = document.createElement('div');
+    popup.id = 'ff-fallback-popup';
+    popup.innerHTML = `
+      <style>
+        #ff-fallback-popup {
+          position: fixed;
+          top: 16px;
+          left: 50%;
+          transform: translateX(-50%);
+          z-index: 2147483647;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          animation: ff-popup-in 0.3s ease-out;
+        }
+        #ff-fallback-popup * { box-sizing: border-box; margin: 0; padding: 0; }
+        @keyframes ff-popup-in {
+          from { opacity: 0; transform: translateX(-50%) translateY(-12px); }
+          to { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+        .ff-popup-card {
+          background: white;
+          border-radius: 12px;
+          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25), 0 0 0 2px #ff5722;
+          padding: 16px 20px;
+          min-width: 320px;
+          max-width: 420px;
+        }
+        .ff-popup-card.minimized {
+          min-width: auto;
+          padding: 8px 16px;
+          cursor: pointer;
+          border-radius: 24px;
+        }
+        .ff-popup-card.minimized .ff-popup-full { display: none; }
+        .ff-popup-card.minimized .ff-popup-pill { display: flex; }
+        .ff-popup-pill {
+          display: none;
+          align-items: center;
+          gap: 8px;
+          font-size: 12px;
+          font-weight: 600;
+          color: #ff5722;
+        }
+        .ff-popup-pill-dot {
+          width: 8px; height: 8px; border-radius: 50%;
+          background: #ff5722;
+          animation: ff-blink 1.5s infinite;
+        }
+        @keyframes ff-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+        .ff-popup-title {
+          font-size: 14px;
+          font-weight: 700;
+          color: #dc2626;
+          margin-bottom: 6px;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .ff-popup-msg {
+          font-size: 12px;
+          color: #4b5563;
+          margin-bottom: 12px;
+          line-height: 1.4;
+        }
+        .ff-popup-actions {
+          display: flex;
+          gap: 8px;
+        }
+        .ff-popup-mark {
+          flex: 1;
+          padding: 8px 16px;
+          background: #10b981;
+          color: white;
+          border: none;
+          border-radius: 8px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: background 0.2s;
+        }
+        .ff-popup-mark:hover { background: #059669; }
+        .ff-popup-mark:disabled { background: #d1d5db; color: #6b7280; cursor: not-allowed; }
+        .ff-popup-min {
+          padding: 8px 12px;
+          background: #f3f4f6;
+          color: #6b7280;
+          border: none;
+          border-radius: 8px;
+          font-size: 12px;
+          cursor: pointer;
+          transition: background 0.2s;
+        }
+        .ff-popup-min:hover { background: #e5e7eb; }
+      </style>
+      <div class="ff-popup-card" id="ff-popup-card">
+        <div class="ff-popup-full">
+          <div class="ff-popup-title">
+            <span>Attendance Not Detected</span>
+          </div>
+          <div class="ff-popup-msg">
+            ${
+              hasBooking
+                ? `Auto-attendance could not be confirmed for <strong>${clientName}</strong>. Please mark your presence manually.`
+                : `No scheduled meeting found for this call. If you have a meeting now, please mark present or contact admin.`
+            }
+          </div>
+          <div class="ff-popup-actions">
+            <button class="ff-popup-mark" id="ff-popup-mark-btn"${hasBooking ? '' : ' disabled'}>
+              ${hasBooking ? 'Mark Present' : 'No Meeting Found'}
+            </button>
+            <button class="ff-popup-min" id="ff-popup-min-btn">Minimize</button>
+          </div>
+        </div>
+        <div class="ff-popup-pill">
+          <div class="ff-popup-pill-dot"></div>
+          <span>Attendance pending — tap to mark</span>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(popup);
+
+    // Mark Present button
+    const markBtn = document.getElementById('ff-popup-mark-btn');
+    if (markBtn && hasBooking) {
+      markBtn.addEventListener('click', () => {
+        markBtn.disabled = true;
+        markBtn.textContent = 'Marking...';
+        chrome.runtime.sendMessage(
+          {
+            type: 'MEET_MANUAL_MARK',
+            bookingId: currentBooking.bookingId,
+            meetLink: window.location.href,
+          },
+          (response) => {
+            if (response?.success) {
+              joinReported = true;
+              removeFallbackPopup();
+              updateWidgetState('present', 'Present - Attendance recorded');
+            } else {
+              markBtn.disabled = false;
+              markBtn.textContent = 'Retry - Mark Present';
+            }
+          }
+        );
+      });
+    }
+
+    // Minimize button
+    const minBtn = document.getElementById('ff-popup-min-btn');
+    if (minBtn) {
+      minBtn.addEventListener('click', () => {
+        const card = document.getElementById('ff-popup-card');
+        if (card) card.classList.add('minimized');
+      });
+    }
+
+    // Click pill to expand
+    popup.addEventListener('click', (e) => {
+      const card = document.getElementById('ff-popup-card');
+      if (card?.classList.contains('minimized') && !e.target.closest('.ff-popup-mark')) {
+        card.classList.remove('minimized');
+      }
+    });
+  }
+
+  function removeFallbackPopup() {
+    clearTimeout(fallbackPopupTimeout);
+    fallbackPopupTimeout = null;
+    document.getElementById('ff-fallback-popup')?.remove();
+  }
+
   // ==================== Core: Report join immediately ====================
 
   function onCallDetected() {
     if (joinReported) return;
     isInCall = true;
-    callStartTime = Date.now();
+    if (!callStartTime) callStartTime = Date.now();
+    beaconSent = false; // Reset for new session
 
     console.log('[FF-MEET] In-call detected! Reporting to background...');
+
+    // Attach leave button interceptor for earliest-possible leave detection
+    attachLeaveButtonInterceptor();
+
+    // Schedule fallback popup if auto-attendance doesn't work within 30s
+    if (!fallbackPopupTimeout) {
+      fallbackPopupTimeout = setTimeout(() => {
+        if (!joinReported) {
+          console.log('[FF-MEET] Auto-attendance not confirmed after 30s — showing fallback popup');
+          showFallbackPopup();
+        }
+      }, FALLBACK_POPUP_DELAY_MS);
+    }
 
     // Immediately tell background to report join
     chrome.runtime.sendMessage(
@@ -117,11 +366,11 @@
           if (response.booking) {
             currentBooking = response.booking;
           }
+          removeFallbackPopup();
           updateWidgetState('present', 'Auto-detected - Present');
           console.log('[FF-MEET] Join reported successfully!', response.booking?.clientName);
         } else if (response?.noMatch) {
           console.log('[FF-MEET] No matching meeting found, will retry...');
-          // Retry in 10 seconds - meetings list might not be loaded yet
           setTimeout(onCallDetected, 10000);
         } else {
           console.warn('[FF-MEET] Join report failed:', response?.error);
@@ -137,6 +386,10 @@
     const duration = scrapeMeetDuration() || getElapsedStr();
     console.log('[FF-MEET] Call ended. Duration:', duration);
 
+    // Fire beacon as redundant safety (in case chrome.runtime.sendMessage fails)
+    sendBeaconLeave();
+
+    // Also notify background via normal message passing
     chrome.runtime.sendMessage({
       type: 'MEET_CALL_ENDED',
       url: window.location.href,
@@ -144,6 +397,7 @@
       durationMs: callStartTime ? Date.now() - callStartTime : 0,
     });
 
+    removeFallbackPopup();
     updateWidgetState('idle', 'Call ended - ' + duration);
   }
 
@@ -467,6 +721,7 @@
         (response) => {
           if (response?.success) {
             joinReported = true;
+            removeFallbackPopup();
             updateWidgetState('present', 'Present - Attendance recorded');
           } else {
             btn.disabled = false;
@@ -531,6 +786,7 @@
 
     if (message.type === 'MEET_ATTENDANCE_CONFIRMED') {
       joinReported = true;
+      removeFallbackPopup();
       updateWidgetState('present', 'Present - Attendance recorded');
       sendResponse({ success: true });
     }
@@ -538,9 +794,10 @@
     return true;
   });
 
-  // ==================== Main Loop ====================
+  // ==================== Main Loop (MutationObserver + fallback poll) ====================
 
   let prevInCall = false;
+  let pendingCheck = false;
 
   function tick() {
     const nowInCall = detectInCall();
@@ -551,6 +808,9 @@
       isInCall = true;
       callStartTime = Date.now();
       updateWidgetState('in-call', 'In call - reporting...');
+
+      // Attach leave button interceptor
+      attachLeaveButtonInterceptor();
 
       // Immediately report join
       if (!joinReported) {
@@ -569,6 +829,11 @@
     if (isInCall || callStartTime) {
       updateDuration();
     }
+
+    // Re-attach leave button interceptor periodically (Meet may recreate buttons)
+    if (isInCall) {
+      attachLeaveButtonInterceptor();
+    }
   }
 
   // ==================== Init ====================
@@ -580,14 +845,21 @@
     console.log('[FF-MEET] Initializing on meet:', code);
     createWidget();
 
-    // Get BDA auth info
+    // Get BDA auth info + cache token for sendBeacon
     chrome.runtime.sendMessage({ type: 'GET_AUTH' }, (response) => {
       if (chrome.runtime.lastError) return;
       if (response?.bdaInfo) {
         bdaInfo = response.bdaInfo;
         authChecked = true;
         const nameEl = document.getElementById('ff-name');
-        if (nameEl) nameEl.textContent = bdaInfo.name || bdaInfo.email || '';
+        if (nameEl) {
+          const n = bdaInfo.name && String(bdaInfo.name).trim() ? String(bdaInfo.name).trim() : '';
+          nameEl.textContent = n || bdaInfo.email || '';
+        }
+      }
+      // Cache token for sendBeacon (sendBeacon can't set Authorization header)
+      if (response?.token) {
+        storedToken = response.token;
       }
     });
 
@@ -603,14 +875,32 @@
       }
     );
 
-    // Check every 2 seconds (fast enough for detection, light on CPU)
-    checkInterval = setInterval(tick, 2000);
+    // Enhanced beforeunload: fire beacon FIRST, then show dialog
+    window.addEventListener('beforeunload', (e) => {
+      if (isInCall) {
+        sendBeaconLeave(); // Guaranteed to fire even during tab close
+        e.preventDefault();
+        e.returnValue = 'Meeting in progress. Your attendance will be recorded as LEFT if you close.';
+      }
+    });
 
-    // Also check immediately and at 5s (Meet UI loads progressively)
-    setTimeout(tick, 1000);
-    setTimeout(tick, 3000);
-    setTimeout(tick, 5000);
-    setTimeout(tick, 10000);
+    // PRIMARY: MutationObserver for near-instant join/leave detection
+    const domObserver = new MutationObserver(() => {
+      if (!pendingCheck) {
+        pendingCheck = true;
+        requestAnimationFrame(() => {
+          pendingCheck = false;
+          tick();
+        });
+      }
+    });
+    domObserver.observe(document.body, { childList: true, subtree: true });
+
+    // FALLBACK: 10s poll as safety net (in case MutationObserver misses something)
+    checkInterval = setInterval(tick, FALLBACK_POLL_INTERVAL_MS);
+
+    // Initial check
+    tick();
   }
 
   // Google Meet loads progressively — wait for DOM to be ready
@@ -622,7 +912,7 @@
 
   // Also handle SPA navigation within Meet
   let lastUrl = location.href;
-  const observer = new MutationObserver(() => {
+  const navObserver = new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       const code = extractMeetCode();
@@ -631,5 +921,5 @@
       }
     }
   });
-  observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+  navObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
 })();
