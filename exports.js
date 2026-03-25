@@ -1,6 +1,6 @@
 // API Configuration
-export const API_BASE_URL = 'http://localhost:5000';
-// export const API_BASE_URL = 'https://flashfire-backend-9wv0.onrender.com';
+// export const API_BASE_URL = 'http://localhost:5000';
+export const API_BASE_URL = 'https://flashfire-backend-9wv0.onrender.com';
 
 // API Endpoints
 export const API_ENDPOINTS = {
