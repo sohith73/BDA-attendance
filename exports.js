@@ -1,5 +1,8 @@
-// API Configuration
-// export const API_BASE_URL = 'http://localhost:5000';
+// API Configuration — single source for panel, background, and meet content script
+//
+// API_BASE_URL MUST be the MAIN backend (flashfire-website-backend / Express).
+//
+// Local dev: set API_BASE_URL to your Express origin (e.g. http://localhost:5000) and add it to manifest.json host_permissions
 export const API_BASE_URL = 'https://flashfire-backend-9wv0.onrender.com';
 
 // API Endpoints
@@ -13,6 +16,7 @@ export const API_ENDPOINTS = {
   MANUAL_MARK: '/api/bda-attendance/manual-mark',
   MARK_ABSENT: '/api/bda-attendance/mark-absent',
   BEACON_LEAVE: '/api/bda-attendance/beacon-leave',
+  BEACON_END_EVENT: '/api/bda-attendance/beacon-end-event',
   UPDATE_NAME: '/api/bda-attendance/update-name',
   SSE: '/api/bda-attendance/sse'
 };
@@ -28,6 +32,7 @@ export const API_URLS = {
   MANUAL_MARK: `${API_BASE_URL}${API_ENDPOINTS.MANUAL_MARK}`,
   MARK_ABSENT: `${API_BASE_URL}${API_ENDPOINTS.MARK_ABSENT}`,
   BEACON_LEAVE: `${API_BASE_URL}${API_ENDPOINTS.BEACON_LEAVE}`,
+  BEACON_END_EVENT: `${API_BASE_URL}${API_ENDPOINTS.BEACON_END_EVENT}`,
   UPDATE_NAME: `${API_BASE_URL}${API_ENDPOINTS.UPDATE_NAME}`,
   SSE: `${API_BASE_URL}${API_ENDPOINTS.SSE}`
 };

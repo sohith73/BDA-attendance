@@ -1,17 +1,18 @@
 // ==================== FlashFire BDA Attendance - Google Meet Content Script ====================
-// Injected ONLY into meet.google.com/* pages
+// Injected ONLY into meet.google.com/* pages (ES module — see manifest "type": "module")
 // PRIMARY auto-detection: detects when BDA joins a call and immediately reports to background
 // Uses MutationObserver for near-instant join/leave detection + sendBeacon for reliable leave reporting
+
+import { API_URLS } from './exports.js';
 
 (function () {
   if (window.__ffMeetContentInjected) return;
   window.__ffMeetContentInjected = true;
 
   // ==================== Constants ====================
-
-  const BEACON_LEAVE_URL = 'http://localhost:5000/api/bda-attendance/beacon-leave';
-  const BEACON_END_EVENT_URL = 'http://localhost:5000/api/bda-attendance/beacon-end-event';
-  // Production: swap hosts to https://flashfire-backend-9wv0.onrender.com
+  // Same base as panel/background (exports.js) — main backend only
+  const BEACON_LEAVE_URL = API_URLS.BEACON_LEAVE;
+  const BEACON_END_EVENT_URL = API_URLS.BEACON_END_EVENT;
   const FALLBACK_POPUP_DELAY_MS = 30000; // Show fallback popup after 30s if auto-attendance fails
   const FALLBACK_POLL_INTERVAL_MS = 10000; // 10s safety-net poll (backup for MutationObserver)
 

@@ -11,8 +11,7 @@
   ],
   "host_permissions": [
     "https://meet.google.com/*",
-    "https://flashfire-backend-9wv0.onrender.com/*",
-    "http://localhost:5000/*"
+    "https://flashfire-backend-9wv0.onrender.com/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -27,6 +26,7 @@
     {
       "matches": ["https://meet.google.com/*"],
       "js": ["meet-content.js"],
+      "type": "module",
       "run_at": "document_end"
     }
   ],
