@@ -26,6 +26,12 @@ const warnAbsentInFlight = new Set();
 
 const leaveReportInFlight = new Set();
 
+// ==================== Timing Config ====================
+// Handle real-world late joins (2-3 min): avoid early absent mark
+const WARN_AFTER_MS = 2 * 60 * 1000; // 2 min after start
+const POPUP_AFTER_MS = 2 * 60 * 1000; // show popup at 2 min
+const FINAL_ABSENT_AFTER_MS = 5 * 60 * 1000; // final absent at 5 min
+
 // ==================== Storage Helpers ====================
 
 async function loadTrackedState() {
@@ -393,8 +399,8 @@ async function checkMeetings() {
       }
     }
 
-    // ---- 60-second warning: BDA not in meet, send Discord reminder (once per booking, server + client dedupe) ----
-    if (nowMs >= startMs + 60 * 1000 && !isHandled(bookingId)) {
+    // ---- warning: BDA not in meet, send Discord reminder (once per booking, server + client dedupe) ----
+    if (nowMs >= startMs + WARN_AFTER_MS && !isHandled(bookingId)) {
       const warnKey = `bda_warned_${bookingId}`;
       const warnData = await chrome.storage.local.get([warnKey]);
 
@@ -408,7 +414,7 @@ async function checkMeetings() {
 
           if (warnResult?.success) {
             await chrome.storage.local.set({ [warnKey]: Date.now() });
-            console.log(`[BDA-BG] 2-min warn-absent sent for ${bookingId}`);
+            console.log(`[BDA-BG] ${WARN_AFTER_MS / 60000}-min warn-absent sent for ${bookingId}`);
           } else {
             warnAbsentInFlight.delete(bookingId);
             console.warn(`[BDA-BG] warn-absent not confirmed for ${bookingId}, will retry`);
@@ -419,8 +425,8 @@ async function checkMeetings() {
       }
     }
 
-    // ---- 60-second absent check popup ----
-    if (nowMs >= startMs + 60 * 1000 && !isHandled(bookingId)) {
+    // ---- absent check popup + delayed final mark ----
+    if (nowMs >= startMs + POPUP_AFTER_MS && !isHandled(bookingId)) {
       const notifKey = `bda_notified_${bookingId}`;
       const notifData = await chrome.storage.local.get([notifKey]);
 
@@ -431,13 +437,16 @@ async function checkMeetings() {
           type: 'basic',
           iconUrl: 'icons/icon128.png',
           title: 'Meeting Attendance Check',
-          message: `Are you in the meeting for ${meeting.clientName}? Open the extension to mark attendance.`,
+          message: `Are you in meeting for ${meeting.clientName}? You have a grace window before absent is marked.`,
           priority: 2,
           requireInteraction: true,
         });
 
-        // Set alarm for final absent mark (60 seconds from now)
-        chrome.alarms.create(`absent-check-${bookingId}`, { delayInMinutes: 1 });
+        // Set alarm for final absent mark at meeting-start + FINAL_ABSENT_AFTER_MS
+        const remainingMs = Math.max(1000, startMs + FINAL_ABSENT_AFTER_MS - nowMs);
+        chrome.alarms.create(`absent-check-${bookingId}`, {
+          delayInMinutes: remainingMs / 60000,
+        });
 
         addEventLog({
           type: 'absent_check',
@@ -717,12 +726,59 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       return;
     }
 
-    // Still no attendance after 2 min - mark absent
+    // Final re-check: if tab is open in real Meet room, report join instead of absent.
+    // Handles late joins around 2-3 min.
+    try {
+      const meetTabs = await chrome.tabs.query({ url: 'https://meet.google.com/*' });
+      const validTabs = meetTabs.filter((t) => !isGoogleMeetLandingUrl(t.url) && extractMeetCode(t.url));
+      let matchedTab = null;
+      if (meeting) {
+        for (const tab of validTabs) {
+          const code = extractMeetCode(tab.url);
+          if (doesMeetMatchBooking(code, meeting)) {
+            matchedTab = tab;
+            break;
+          }
+        }
+      }
+
+      if (!matchedTab && meeting && validTabs.length === 1) {
+        matchedTab = validTabs[0];
+      }
+
+      if (matchedTab && meeting) {
+        const joinResult = await apiFetch(API.REPORT_JOIN, {
+          method: 'POST',
+          body: JSON.stringify({
+            bookingId,
+            meetLink: matchedTab.url,
+            joinedAt: new Date().toISOString(),
+          }),
+        });
+        if (joinResult?.success && !joinResult?.markedAbsent) {
+          await setTracked(bookingId, {
+            meetCode: extractMeetCode(matchedTab.url),
+            tabId: matchedTab.id,
+            reported: true,
+            joinedAt: Date.now(),
+            leaveReported: false,
+            trackedAt: Date.now(),
+          });
+          chrome.notifications.clear(`attend-${bookingId}`);
+          await fetchMeetings(true);
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn(`[BDA-BG] absent-check late-join recheck failed for ${bookingId}:`, err?.message || err);
+    }
+
+    // Still no attendance after grace window - mark absent
     const result = await apiFetch(API.MARK_ABSENT, {
       method: 'POST',
       body: JSON.stringify({
         bookingId,
-        reason: 'no_response_to_popup',
+        reason: 'no_response_within_grace_window',
       }),
     });
 
