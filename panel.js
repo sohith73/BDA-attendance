@@ -432,9 +432,15 @@ function renderMeetingCard(meeting, context) {
 
   const timeStr = formatDateTime(start);
 
-  const claimedByStr = meeting.claimedBy
-    ? `<div class="meeting-assigned">Assigned to ${escapeHtml(meeting.claimedBy.name || meeting.claimedBy.email)}</div>`
-    : '';
+  // Prefer the Calendly round-robin host (who the meeting is assigned to);
+  // fall back to a manual CRM claim, else show "Unassigned".
+  const assignedName =
+    (meeting.calendlyHost && (meeting.calendlyHost.name || meeting.calendlyHost.email)) ||
+    (meeting.claimedBy && (meeting.claimedBy.name || meeting.claimedBy.email)) ||
+    null;
+  const claimedByStr = assignedName
+    ? `<div class="meeting-assigned">Assigned to ${escapeHtml(assignedName)}</div>`
+    : `<div class="meeting-assigned meeting-assigned-empty">Assigned to <span class="unassigned">Unassigned</span></div>`;
 
   const liveDot = status === 'active' ? '<span class="badge-dot"></span>' : '';
 
