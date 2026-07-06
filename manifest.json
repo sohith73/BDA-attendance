@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FlashFire BDA Attendance",
-  "version": "1.0.1",
+  "version": "1.0.6",
   "description": "Auto-track BDA meeting attendance for Google Meet",
   "permissions": ["tabs", "alarms", "storage", "notifications"],
   "host_permissions": [
@@ -21,7 +21,6 @@
     {
       "matches": ["https://meet.google.com/*"],
       "js": ["meet-content.js"],
-      "type": "module",
       "run_at": "document_end"
     }
   ],
@@ -40,7 +39,9 @@
         "panel.js",
         "styles.css",
         "exports.js",
-        "meet-content.js"
+        "meet-content.js",
+        "icons/icon48.png",
+        "icons/icon128.png"
       ],
       "matches": ["<all_urls>"]
     }

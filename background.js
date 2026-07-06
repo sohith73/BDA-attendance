@@ -28,8 +28,12 @@ const leaveReportInFlight = new Set();
 
 // ==================== Timing Config ====================
 // Handle real-world late joins (2-3 min): avoid early absent mark
-const WARN_AFTER_MS = 2 * 60 * 1000; // 2 min after start
-const POPUP_AFTER_MS = 2 * 60 * 1000; // show popup at 2 min
+const WARN_AFTER_MS = 2 * 60 * 1000; // 2 min after start (Discord warn — keeps late-join grace)
+// Fire the "are you in the meeting?" reminder right at meeting start so the BDA
+// is prompted on time. It used to fire at start+2min and then drift another few
+// minutes on the 1-min poll (arriving ~5 min late); it is now armed as a precise
+// per-meeting alarm at exactly this offset. The absent grace is unchanged below.
+const POPUP_AFTER_MS = 0; // reminder popup at meeting start
 const FINAL_ABSENT_AFTER_MS = 5 * 60 * 1000; // final absent at 5 min
 
 // ==================== Storage Helpers ====================
@@ -240,6 +244,44 @@ function hasServerAttendance(meeting) {
   return meeting.attendance && ['present', 'manual', 'absent'].includes(meeting.attendance.status);
 }
 
+// Show the "are you in the meeting?" reminder once, then arm the final-absent
+// alarm. Safe to call from either the poll or a precise per-meeting alarm — it
+// dedupes on bda_notified_<bookingId> and bails if the meeting is already handled.
+async function firePopupNotification(meeting) {
+  const bookingId = meeting.bookingId;
+  if (isHandled(bookingId) || hasServerAttendance(meeting)) {
+    chrome.alarms.clear(`popup-${bookingId}`);
+    return;
+  }
+
+  const notifKey = `bda_notified_${bookingId}`;
+  const notifData = await chrome.storage.local.get([notifKey]);
+  if (notifData[notifKey]) return;
+  await chrome.storage.local.set({ [notifKey]: Date.now() });
+
+  chrome.notifications.create(`attend-${bookingId}`, {
+    type: 'basic',
+    iconUrl: 'icons/icon128.png',
+    title: 'Meeting Attendance Check',
+    message: `Are you in meeting for ${meeting.clientName}? You have a grace window before absent is marked.`,
+    priority: 2,
+    requireInteraction: true,
+  });
+
+  // Final absent mark at meeting-start + FINAL_ABSENT_AFTER_MS.
+  const startMs = new Date(meeting.scheduledStart).getTime();
+  const remainingMs = Math.max(1000, startMs + FINAL_ABSENT_AFTER_MS - getServerTime().getTime());
+  chrome.alarms.create(`absent-check-${bookingId}`, {
+    delayInMinutes: remainingMs / 60000,
+  });
+
+  addEventLog({
+    type: 'absent_check',
+    bookingId,
+    clientName: meeting.clientName,
+  });
+}
+
 // ==================== Core Meeting Check Logic ====================
 
 async function checkMeetings() {
@@ -300,6 +342,7 @@ async function checkMeetings() {
       }
       chrome.alarms.clear(`absent-check-${bookingId}`);
       chrome.alarms.clear(`warning-${bookingId}`);
+      chrome.alarms.clear(`popup-${bookingId}`);
       chrome.notifications.clear(`attend-${bookingId}`);
       continue;
     }
@@ -343,34 +386,27 @@ async function checkMeetings() {
       }
     }
 
-    // ---- absent check popup + delayed final mark ----
-    if (nowMs >= startMs + POPUP_AFTER_MS && !isHandled(bookingId)) {
+    // ---- attendance reminder popup (precise) + delayed final absent mark ----
+    if (!isHandled(bookingId)) {
       const notifKey = `bda_notified_${bookingId}`;
       const notifData = await chrome.storage.local.get([notifKey]);
 
       if (!notifData[notifKey]) {
-        await chrome.storage.local.set({ [notifKey]: Date.now() });
-
-        chrome.notifications.create(`attend-${bookingId}`, {
-          type: 'basic',
-          iconUrl: 'icons/icon128.png',
-          title: 'Meeting Attendance Check',
-          message: `Are you in meeting for ${meeting.clientName}? You have a grace window before absent is marked.`,
-          priority: 2,
-          requireInteraction: true,
-        });
-
-        // Set alarm for final absent mark at meeting-start + FINAL_ABSENT_AFTER_MS
-        const remainingMs = Math.max(1000, startMs + FINAL_ABSENT_AFTER_MS - nowMs);
-        chrome.alarms.create(`absent-check-${bookingId}`, {
-          delayInMinutes: remainingMs / 60000,
-        });
-
-        addEventLog({
-          type: 'absent_check',
-          bookingId,
-          clientName: meeting.clientName,
-        });
+        const popupMs = startMs + POPUP_AFTER_MS;
+        if (nowMs >= popupMs) {
+          await firePopupNotification(meeting);
+        } else {
+          // Arm a one-shot alarm at the exact popup time so the reminder is not
+          // delayed by up to a full 1-min poll interval (root cause of the
+          // "reminder comes minutes late" report). delayInMinutes is a real
+          // duration, so it stays correct regardless of client/server clock skew.
+          const existing = await chrome.alarms.get(`popup-${bookingId}`);
+          if (!existing) {
+            chrome.alarms.create(`popup-${bookingId}`, {
+              delayInMinutes: Math.max(0, (popupMs - nowMs) / 60000),
+            });
+          }
+        }
       }
     }
   }
@@ -619,6 +655,25 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       chrome.alarms.clear('keepalive');
       console.log('[BDA-BG] Keepalive: no active tracking, alarm cleared');
     }
+    return;
+  }
+
+  // Precise attendance-reminder popup fired at meeting start.
+  if (alarm.name.startsWith('popup-')) {
+    const bookingId = alarm.name.replace('popup-', '');
+
+    await loadAuth();
+    await loadTrackedState();
+    if (isHandled(bookingId)) {
+      chrome.alarms.clear(`popup-${bookingId}`);
+      return;
+    }
+
+    await fetchMeetings(true);
+    if (!meetings) return;
+    const all = [...(meetings.upcoming || []), ...(meetings.previous || [])];
+    const meeting = all.find((m) => m.bookingId === bookingId);
+    if (meeting) await firePopupNotification(meeting);
     return;
   }
 
@@ -889,7 +944,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (matched) {
-        sendResponse({ booking: { bookingId: matched.bookingId, clientName: matched.clientName } });
+        sendResponse({ booking: { bookingId: matched.bookingId, clientName: matched.clientName, scheduledStart: matched.scheduledStart } });
       } else {
         sendResponse({ booking: null });
       }
@@ -1091,7 +1146,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         sendResponse({
           success: true,
-          booking: { bookingId: matched.bookingId, clientName: matched.clientName },
+          booking: { bookingId: matched.bookingId, clientName: matched.clientName, scheduledStart: matched.scheduledStart },
         });
       } else {
         sendResponse({ success: false, error: 'API call failed' });

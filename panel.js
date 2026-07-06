@@ -42,6 +42,12 @@ const eventEmpty = document.getElementById('event-empty');
 const connectionDot = document.getElementById('connection-dot');
 const connectionStatus = document.getElementById('connection-status');
 const refreshBtn = document.getElementById('refresh-btn');
+const quickMarkBtn = document.getElementById('quick-mark-btn');
+const quickToast = document.getElementById('quick-toast');
+
+// How far before the scheduled start a meeting counts as "live" (matches the
+// Live Now badge). Mark Present and the header logo both unlock at this point.
+const LIVE_LEAD_MS = 2 * 60 * 1000;
 
 // ==================== State ====================
 
@@ -310,6 +316,7 @@ function showDashboard() {
   loadMeetings();
   loadEventLog();
   connectSSE();
+  startLiveTick();
 }
 
 logoutBtn.addEventListener('click', async () => {
@@ -377,6 +384,104 @@ function renderMeetings() {
   document.querySelectorAll('.btn-end').forEach((btn) => {
     btn.addEventListener('click', handlePanelEndMeet);
   });
+
+  updateQuickMarkButton();
+}
+
+// ==================== Quick-mark logo (header) ====================
+
+// The single meeting that is live right now and still needs attendance:
+// within [start-2min, end || start+30min] and not yet marked. null if none.
+function findLiveMeeting() {
+  if (!meetings) return null;
+  const now = meetings.serverTime ? new Date(meetings.serverTime) : new Date();
+  const all = [...(meetings.upcoming || []), ...(meetings.previous || [])];
+  return (
+    all.find((m) => {
+      if (m.attendance) return false;
+      const start = new Date(m.scheduledStart);
+      const end = m.scheduledEnd ? new Date(m.scheduledEnd) : new Date(start.getTime() + 30 * 60 * 1000);
+      return now >= new Date(start.getTime() - LIVE_LEAD_MS) && now <= end;
+    }) || null
+  );
+}
+
+// Reflect the current live meeting on the header logo: pulse + actionable title
+// when one exists, otherwise show the next upcoming meeting time as a hint.
+function updateQuickMarkButton() {
+  if (!quickMarkBtn) return;
+  const live = findLiveMeeting();
+  if (live) {
+    quickMarkBtn.classList.add('live');
+    quickMarkBtn.disabled = false;
+    quickMarkBtn.title = `Mark present for ${live.clientName}`;
+    return;
+  }
+  quickMarkBtn.classList.remove('live');
+  quickMarkBtn.disabled = false;
+  const next = (meetings?.upcoming || [])
+    .map((m) => ({ m, start: new Date(m.scheduledStart) }))
+    .filter((x) => x.start >= new Date())
+    .sort((a, b) => a.start - b.start)[0];
+  quickMarkBtn.title = next
+    ? `Next: ${next.m.clientName} at ${formatDateTime(next.start)}`
+    : 'No live meeting right now';
+}
+
+// Click: mark the live meeting present (sends to backend). If none is live,
+// surface the next meeting time instead of doing nothing.
+async function handleQuickMark() {
+  const live = findLiveMeeting();
+  if (!live) {
+    const next = (meetings?.upcoming || [])
+      .map((m) => ({ m, start: new Date(m.scheduledStart) }))
+      .filter((x) => x.start >= new Date())
+      .sort((a, b) => a.start - b.start)[0];
+    showToast(
+      next ? `Next meeting: ${next.m.clientName} at ${formatDateTime(next.start)}` : 'No live or upcoming meeting',
+      'info'
+    );
+    return;
+  }
+
+  quickMarkBtn.disabled = true;
+  const result = await sendMessage({
+    type: 'MANUAL_MARK',
+    bookingId: live.bookingId,
+    clientName: live.clientName,
+  });
+
+  if (result?.success) {
+    showToast(`Marked present for ${live.clientName}`, 'success');
+    await loadMeetings(true);
+  } else {
+    showToast(result?.error || 'Could not mark present', 'error');
+    quickMarkBtn.disabled = false;
+  }
+}
+
+let toastTimer = null;
+function showToast(text, kind = 'info') {
+  if (!quickToast) return;
+  quickToast.textContent = text;
+  quickToast.className = `quick-toast show ${kind}`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    quickToast.className = 'quick-toast';
+  }, 3200);
+}
+
+if (quickMarkBtn) quickMarkBtn.addEventListener('click', handleQuickMark);
+
+// Re-render on a timer so cards flip to "Live Now" / reveal Mark Present as the
+// clock reaches each meeting, even when no SSE event arrives in that window.
+let liveTickStarted = false;
+function startLiveTick() {
+  if (liveTickStarted) return;
+  liveTickStarted = true;
+  setInterval(() => {
+    if (meetings && dashboardScreen.style.display !== 'none') renderMeetings();
+  }, 20000);
 }
 
 function renderMeetingCard(meeting, context) {
@@ -417,8 +522,13 @@ function renderMeetingCard(meeting, context) {
     badgeClass = 'badge-pending';
   }
 
-  // Can mark manually?
-  const canMark = !meeting.attendance && now >= start && now <= new Date(start.getTime() + 2 * 60 * 60 * 1000);
+  // Can mark manually? Unlocks the moment the card goes "Live Now" (start-2min),
+  // so the BDA can mark present as soon as the meeting time matches — no need to
+  // wait until the scheduled minute has fully passed.
+  const canMark =
+    !meeting.attendance &&
+    now >= new Date(start.getTime() - LIVE_LEAD_MS) &&
+    now <= new Date(start.getTime() + 2 * 60 * 60 * 1000);
 
   const inLiveWindow =
     now >= new Date(start.getTime() - 5 * 60 * 1000) &&

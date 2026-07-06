@@ -318,6 +318,84 @@ body {
   text-overflow: ellipsis;
 }
 
+.btn-quickmark {
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 50%;
+  cursor: pointer;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  transition: background var(--ff-transition), transform var(--ff-transition), box-shadow var(--ff-transition);
+}
+
+.btn-quickmark img {
+  width: 22px;
+  height: 22px;
+  display: block;
+  object-fit: contain;
+}
+
+.btn-quickmark:hover {
+  transform: translateY(-1px) scale(1.06);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+}
+
+.btn-quickmark:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Green ring pulse when a meeting is live and markable */
+.btn-quickmark.live::after {
+  content: '';
+  position: absolute;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 2px solid #10b981;
+  animation: pulse-dot 1.6s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.btn-quickmark.live {
+  position: relative;
+}
+
+.quick-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 64px;
+  transform: translateX(-50%) translateY(8px);
+  max-width: 88%;
+  padding: 10px 14px;
+  background: #111827;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s ease, transform 0.22s ease;
+  z-index: 40;
+}
+
+.quick-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.quick-toast.success { background: #059669; }
+.quick-toast.error { background: #dc2626; }
+
 .btn-logout {
   width: 34px;
   height: 34px;

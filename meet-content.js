@@ -1,24 +1,30 @@
 // ==================== FlashFire BDA Attendance - Google Meet Content Script ====================
-// Injected ONLY into meet.google.com/* pages (ES module — see manifest "type": "module")
+// Injected ONLY into meet.google.com/* pages.
+// IMPORTANT: This is a CLASSIC content script — Chrome content scripts do NOT support
+// ES modules, so no import statements here. An `import` would throw a SyntaxError and
+// the whole script (widget included) would silently never run.
 // PRIMARY auto-detection: detects when BDA joins a call and immediately reports to background
 // Uses MutationObserver for near-instant join/leave detection + sendBeacon for reliable leave reporting
-
-import { API_URLS } from './exports.js';
 
 (function () {
   if (window.__ffMeetContentInjected) return;
   window.__ffMeetContentInjected = true;
 
   // ==================== Constants ====================
-  // Same base as panel/background (exports.js) — main backend only
-  const BEACON_LEAVE_URL = API_URLS.BEACON_LEAVE;
-  const BEACON_END_EVENT_URL = API_URLS.BEACON_END_EVENT;
+  // Same base as panel/background (exports.js) — main backend only. Kept inline
+  // because this classic script cannot import exports.js.
+  const API_BASE_URL = 'https://flashfire-backend-9wv0.onrender.com';
+  const BEACON_LEAVE_URL = `${API_BASE_URL}/api/bda-attendance/beacon-leave`;
+  const BEACON_END_EVENT_URL = `${API_BASE_URL}/api/bda-attendance/beacon-end-event`;
   const FALLBACK_POPUP_DELAY_MS = 30000; // Show fallback popup after 30s if auto-attendance fails
   // Confirmation windows: the "Leave call" button must persist before we trust a
   // join (kills momentary DOM flickers) and must stay gone before we trust a leave
   // (Meet rebuilds its control bar constantly during the call).
   const JOIN_DWELL_MS = 3000; // leave-call must be present continuously for 3s (flicker guard, stays near real-time)
   const LEAVE_DEBOUNCE_MS = 10000; // leave-call must be gone continuously for 10s
+  // Manual "Mark Present" only unlocks from 1 min before the scheduled start, so a
+  // BDA who opens the room early can't stamp attendance before the meeting window.
+  const MARK_WINDOW_LEAD_MS = 60 * 1000;
 
   // ==================== State ====================
 
@@ -31,6 +37,7 @@ import { API_URLS } from './exports.js';
   // leave (button disappears), so ending tracking doesn't instantly re-start it.
   let suppressUntilRejoin = false;
   let checkInterval = null;
+  let initStarted = false; // init() setup ran once (observers + call-detection loop)
   let widget = null;
   let bdaInfo = null;
   let authChecked = false;
@@ -775,7 +782,7 @@ import { API_URLS } from './exports.js';
       <style>
         #ff-bda-meet-widget {
           position: fixed;
-          z-index: 2147483646;
+          z-index: 2147483647;
           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
           touch-action: none;
           user-select: none;
@@ -798,6 +805,11 @@ import { API_URLS } from './exports.js';
         }
         .ff-toggle:hover { transform: scale(1.1); }
         .ff-toggle svg { width: 24px; height: 24px; fill: white; }
+        .ff-toggle .ff-logo {
+          width: 32px; height: 32px; border-radius: 50%;
+          object-fit: contain; pointer-events: none;
+          -webkit-user-drag: none; user-select: none;
+        }
         .ff-toggle .ff-pulse {
           position: absolute; inset: -4px; border-radius: 50%;
           border: 2px solid #ff5722;
@@ -921,7 +933,7 @@ import { API_URLS } from './exports.js';
 
       <button class="ff-toggle" id="ff-toggle" title="FlashFire Attendance">
         <div class="ff-pulse" id="ff-pulse"></div>
-        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+        <img class="ff-logo" src="${chrome.runtime.getURL('icons/icon48.png')}" alt="FlashFire" draggable="false" />
       </button>
       <div class="ff-ext-dur" id="ff-ext-dur">0:00</div>
       <button class="ff-ext-end" id="ff-ext-end">End Meet</button>
@@ -968,7 +980,12 @@ import { API_URLS } from './exports.js';
     document.getElementById('ff-btn').addEventListener('click', () => {
       const btn = document.getElementById('ff-btn');
       if (btn.disabled || btn.classList.contains('done')) return;
+      if (!isMarkWindowOpen()) {
+        refreshMarkGate();
+        return;
+      }
       btn.disabled = true;
+      btn.dataset.marking = '1';
       btn.textContent = 'Marking...';
 
       chrome.runtime.sendMessage(
@@ -978,6 +995,7 @@ import { API_URLS } from './exports.js';
           meetLink: window.location.href,
         },
         (response) => {
+          delete btn.dataset.marking;
           if (response?.success) {
             joinReported = true;
             removeFallbackPopup();
@@ -1113,6 +1131,66 @@ import { API_URLS } from './exports.js';
       if (client) client.textContent = 'Meeting: ' + currentBooking.clientName;
       if (noMatch) noMatch.style.display = 'none';
       if (btnEl && btnEl.style.display === 'none') btnEl.style.display = 'block';
+      refreshMarkGate();
+    }
+  }
+
+  // ==================== Stay-on-top watchdog ====================
+
+  // Google Meet is an SPA that constantly rebuilds its DOM and toggles fullscreen.
+  // Keep the widget parented to whatever is currently on screen (the fullscreen
+  // element when one is active, else <body>), as the LAST child so nothing paints
+  // over it, and re-assert the max z-index in case Meet's CSS clobbers it.
+  function keepWidgetOnTop() {
+    if (!widget) return;
+    // Never yank the node mid-drag — it would drop the pointer capture.
+    if (widgetDrag && widgetDrag.dragging) return;
+
+    const host = document.fullscreenElement || document.body;
+    if (!host) return;
+
+    // Re-attach only when the widget was removed or the render root changed
+    // (e.g. fullscreen). The max z-index already keeps it above Meet's own layers,
+    // so we avoid re-appending on every DOM mutation, which would restart the
+    // toggle's pulse animation and cause flicker.
+    if (widget.parentElement !== host) {
+      host.appendChild(widget);
+    }
+    if (widget.style.zIndex !== '2147483647') {
+      widget.style.zIndex = '2147483647';
+    }
+  }
+
+  // ==================== Mark Present timing gate ====================
+
+  // True when manual Mark Present is allowed: from (scheduledStart - 1 min) onward.
+  // If we don't yet know the scheduled start (e.g. restored session with no match),
+  // don't block — auto-detection and the server still guard against bad marks.
+  function isMarkWindowOpen() {
+    const startIso = currentBooking?.scheduledStart;
+    if (!startIso) return true;
+    const startMs = new Date(startIso).getTime();
+    if (Number.isNaN(startMs)) return true;
+    return Date.now() >= startMs - MARK_WINDOW_LEAD_MS;
+  }
+
+  // Enable/disable the card's Mark Present button based on the timing window.
+  // Leaves a recorded 'present'/'done' button untouched.
+  function refreshMarkGate() {
+    const btn = document.getElementById('ff-btn');
+    if (!btn || joinReported || btn.classList.contains('done')) return;
+    if (btn.dataset.marking === '1') return; // request in flight
+
+    if (isMarkWindowOpen()) {
+      if (btn.disabled) {
+        btn.disabled = false;
+        btn.textContent = 'Mark Present';
+      }
+    } else {
+      btn.disabled = true;
+      const startIso = currentBooking?.scheduledStart;
+      const t = startIso ? formatClockTime(new Date(startIso).getTime()) : '';
+      btn.textContent = t ? `Mark opens near ${t}` : 'Mark Present';
     }
   }
 
@@ -1216,6 +1294,11 @@ import { API_URLS } from './exports.js';
 
     if (isInCall || callStartTime) updateDuration();
     if (isInCall) attachLeaveButtonInterceptor();
+
+    // Keep the widget visible/on-top through Meet's re-renders, and open the
+    // Mark Present window exactly at start-1min without needing a fresh match.
+    keepWidgetOnTop();
+    refreshMarkGate();
   }
 
   // ==================== Init ====================
@@ -1229,8 +1312,21 @@ import { API_URLS } from './exports.js';
     const code = extractMeetCode();
     if (!code || code.length < 3) return; // Not a real meet page
 
+    // Set up observers + the 1s loop only once. Guard synchronously (before the
+    // first await) so overlapping callers — load, SPA nav, and the guardian below —
+    // can't double-wire the detection loop.
+    if (initStarted) return;
+    initStarted = true;
+
     console.log('[FF-MEET] Initializing on meet:', code);
     currentMeetLink = window.location.href;
+
+    // Paint the widget FIRST — before any await — so the floating button is on
+    // screen immediately and never depends on chrome.storage/auth/booking replies
+    // (a slow or stalled storage callback used to delay the icon indefinitely).
+    createWidget();
+    keepWidgetOnTop();
+    console.log('[FF-MEET] Widget created');
 
     // Restore session from storage (survives page reload / extension restart)
     const session = await restoreSession();
@@ -1242,8 +1338,6 @@ import { API_URLS } from './exports.js';
       }
       console.log('[FF-MEET] Restored session from storage. Duration so far:', getElapsedStr());
     }
-
-    createWidget();
 
     // Get BDA auth info + cache token for sendBeacon
     chrome.runtime.sendMessage({ type: 'GET_AUTH' }, (response) => {
@@ -1296,6 +1390,11 @@ import { API_URLS } from './exports.js';
     });
     domObserver.observe(document.body, { childList: true, subtree: true });
 
+    // Entering/exiting fullscreen changes the render root — re-home immediately so
+    // the widget doesn't get hidden behind the fullscreened element.
+    document.addEventListener('fullscreenchange', keepWidgetOnTop);
+    document.addEventListener('webkitfullscreenchange', keepWidgetOnTop);
+
     // 1s loop drives both the live timer AND the join-dwell / leave-debounce state
     // machine, so confirmation windows resolve at second precision even when Google
     // Meet stops mutating the DOM (e.g. while sitting on a missing control bar).
@@ -1305,22 +1404,40 @@ import { API_URLS } from './exports.js';
     tick();
   }
 
-  // Google Meet loads progressively — wait for DOM to be ready
+  // Guarantee the circular widget is present whenever we're inside a real meeting
+  // room. This runs independently of the side panel and of whether a call is
+  // active — it covers late/progressive loads, SPA navigation into a room, and any
+  // moment Meet rips the node out of the DOM.
+  function ensureWidgetPresent() {
+    if (isGoogleMeetLandingUrl(location.href)) return;
+    const code = extractMeetCode();
+    if (!code || code.length < 3) return; // only inside an actual meeting room
+    if (!initStarted) {
+      init(); // first time on this page: wire observers + call detection + widget
+      return;
+    }
+    if (!widget) createWidget(); // Meet removed it entirely — rebuild from scratch
+    keepWidgetOnTop();           // re-attach a detached node + re-assert max z-index
+  }
+
+  // Google Meet loads progressively — first attempt shortly after load.
   if (document.readyState === 'complete') {
     setTimeout(init, 1500);
   } else {
     window.addEventListener('load', () => setTimeout(init, 1500));
   }
 
-  // Also handle SPA navigation within Meet
+  // Persistent guardian: the safety net that keeps the button always there. 2s is
+  // frequent enough to feel instant and costs only a couple of DOM checks.
+  setInterval(ensureWidgetPresent, 2000);
+  ensureWidgetPresent();
+
+  // React instantly to SPA URL changes so joining a room doesn't wait up to 2s.
   let lastUrl = location.href;
   const navObserver = new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
-      const code = extractMeetCode();
-      if (code && code.length >= 3 && !widget) {
-        setTimeout(init, 1500);
-      }
+      setTimeout(ensureWidgetPresent, 800);
     }
   });
   navObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
