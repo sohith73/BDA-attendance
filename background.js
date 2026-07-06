@@ -204,6 +204,17 @@ function doesMeetMatchBooking(tabMeetCode, booking) {
   return false;
 }
 
+// A booking has NO usable meet code when none of its link fields yield one. Only
+// such bookings may be matched to a tab by "single active meeting" fallback — a
+// booking that DOES carry a code must match that code, never a random tab.
+function bookingHasNoMeetCode(booking) {
+  return !(
+    (booking.googleMeetCode && String(booking.googleMeetCode).trim()) ||
+    extractMeetCode(booking.googleMeetUrl || '') ||
+    extractMeetCode(booking.calendlyMeetLink || '')
+  );
+}
+
 function getServerTime() {
   if (meetings?.serverTime) {
     const serverOffset = new Date(meetings.serverTime).getTime() - meetingsLastFetched;
@@ -298,106 +309,13 @@ async function checkMeetings() {
     // ---- Only process meetings within the active window ----
     if (nowMs < startMs - 2 * 60 * 1000 || nowMs > startMs + 2 * 60 * 60 * 1000) continue;
 
-    // ---- Try to find matching Meet tab ----
-    if (meetTabs.length > 0) {
-      let matchedTab = null;
-
-      // Strategy 1: Direct code match against booking meet fields
-      for (const tab of meetTabs) {
-        const tabMeetCode = extractMeetCode(tab.url);
-        if (doesMeetMatchBooking(tabMeetCode, meeting)) {
-          matchedTab = tab;
-          break;
-        }
-      }
-
-      // Strategy 2: If only 1 active meeting and 1 meet tab, auto-match
-      if (!matchedTab && activeMeetings.length === 1 && meetTabs.length === 1 && activeMeetings[0].bookingId === bookingId) {
-        matchedTab = meetTabs[0];
-        console.log(`[BDA-BG] Auto-match: 1 active meeting + 1 meet tab -> ${bookingId}`);
-      }
-
-      // Strategy 3: If only 1 active meeting and ANY meet tabs exist, pick the first one
-      // (handles case where booking has no meet code stored but BDA is in a meet)
-      if (!matchedTab && activeMeetings.length === 1 && meetTabs.length > 0 && activeMeetings[0].bookingId === bookingId) {
-        matchedTab = meetTabs[0];
-        console.log(`[BDA-BG] Fallback match: 1 active meeting + meet tab open -> ${bookingId}`);
-      }
-
-      if (matchedTab) {
-        const tabMeetCode = extractMeetCode(matchedTab.url);
-
-        const joinData = {
-          bookingId,
-          meetLink: matchedTab.url,
-          joinedAt: new Date().toISOString(),
-        };
-
-        const result = await apiFetch(API.REPORT_JOIN, {
-          method: 'POST',
-          body: JSON.stringify(joinData),
-        });
-
-        if (result?.markedAbsent) {
-          await setTracked(bookingId, {
-            reported: true,
-            leaveReported: true,
-            trackedAt: nowMs,
-          });
-          addEventLog({
-            type: 'absent',
-            bookingId,
-            clientName: meeting.clientName,
-          });
-          await fetchMeetings(true);
-          console.warn(`[BDA-BG] Meet landing URL for ${bookingId} — marked absent on server`);
-        } else if (result?.success) {
-          await setTracked(bookingId, {
-            meetCode: tabMeetCode,
-            tabId: matchedTab.id,
-            reported: true,
-            joinedAt: Date.now(),
-            leaveReported: false,
-            trackedAt: nowMs,
-          });
-
-          addEventLog({
-            type: 'join',
-            bookingId,
-            clientName: meeting.clientName,
-            meetLink: matchedTab.url,
-          });
-
-          // Clear any pending absent/warning alarms
-          chrome.alarms.clear(`absent-check-${bookingId}`);
-          chrome.alarms.clear(`warning-${bookingId}`);
-          chrome.notifications.clear(`attend-${bookingId}`);
-
-          await fetchMeetings(true);
-
-          // Notify Meet content script that attendance is confirmed
-          try {
-            chrome.tabs.sendMessage(matchedTab.id, {
-              type: 'MEET_ATTENDANCE_CONFIRMED',
-              bookingId,
-              clientName: meeting.clientName,
-            }).catch(() => {});
-          } catch {}
-
-          // Also send booking info to the meet tab widget
-          try {
-            chrome.tabs.sendMessage(matchedTab.id, {
-              type: 'MEET_BOOKING_INFO',
-              bookingId,
-              clientName: meeting.clientName,
-            }).catch(() => {});
-          } catch {}
-
-          console.log(`[BDA-BG] AUTO JOIN reported for ${bookingId} via ${matchedTab.url}`);
-        }
-        continue; // Move to next meeting
-      }
-    }
+    // ---- JOIN is NOT reported from tab existence anymore ----
+    // A Meet tab being open only proves a tab exists — it cannot tell the pre-join
+    // green room apart from an actual in-call state, which was the core cause of
+    // false "Present" marks. Real joins are reported by the Meet content script
+    // (MEET_AUTO_JOIN) once it confirms the "Leave call" button has persisted.
+    // Here we only run the warn/absent timers below; the absent-check alarm keeps a
+    // tab-based late-join recovery as a last-resort safety net.
 
     // ---- warning: BDA not in meet, send Discord reminder (once per booking, server + client dedupe) ----
     if (nowMs >= startMs + WARN_AFTER_MS && !isHandled(bookingId)) {
@@ -742,7 +660,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         }
       }
 
-      if (!matchedTab && meeting && validTabs.length === 1) {
+      if (!matchedTab && meeting && validTabs.length === 1 && bookingHasNoMeetCode(meeting)) {
         matchedTab = validTabs[0];
       }
 
@@ -958,13 +876,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       }
 
-      // Fallback: single active meeting
+      // Fallback: single active meeting — only when it has no code to match on,
+      // so the widget never targets the wrong booking for a manual mark.
       if (!matched) {
         const activeMeetings = allMeetings.filter((m) => {
           const startMs = new Date(m.scheduledStart).getTime();
           return nowMs >= startMs - 2 * 60 * 1000 && nowMs <= startMs + 2 * 60 * 60 * 1000 && !hasServerAttendance(m) && !isHandled(m.bookingId);
         });
-        if (activeMeetings.length === 1) {
+        if (activeMeetings.length === 1 && bookingHasNoMeetCode(activeMeetings[0])) {
           matched = activeMeetings[0];
         }
       }
@@ -1090,15 +1009,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       }
 
-      // Strategy 2: Single active unhandled meeting = auto-match
+      // Strategy 2: Single active unhandled meeting that carries NO meet code →
+      // auto-match (can't match by code, and the content script has already
+      // confirmed a real in-call state). A booking WITH a code must match its code.
       if (!matched) {
         const activeMeetings = allMeetings.filter((m) => {
           const startMs = new Date(m.scheduledStart).getTime();
           return nowMs >= startMs - 5 * 60 * 1000 && nowMs <= startMs + 2 * 60 * 60 * 1000 && !hasServerAttendance(m) && !isHandled(m.bookingId);
         });
-        if (activeMeetings.length === 1) {
+        if (activeMeetings.length === 1 && bookingHasNoMeetCode(activeMeetings[0])) {
           matched = activeMeetings[0];
-          console.log(`[BDA-BG] MEET_AUTO_JOIN fallback: single active meeting -> ${matched.bookingId}`);
+          console.log(`[BDA-BG] MEET_AUTO_JOIN fallback: single codeless active meeting -> ${matched.bookingId}`);
         }
       }
 
@@ -1141,11 +1062,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       if (result?.success) {
+        // Anchor tracked.joinedAt to the REAL join moment the content script
+        // measured (not "now"), so a tab-close / keepalive leave computes the
+        // correct duration.
+        const clientJoinedMs = message.joinedAt ? new Date(message.joinedAt).getTime() : Date.now();
         await setTracked(matched.bookingId, {
           meetCode: tabMeetCode,
           tabId: tabId,
           reported: true,
-          joinedAt: Date.now(),
+          joinedAt: Number.isFinite(clientJoinedMs) ? clientJoinedMs : Date.now(),
           leaveReported: false,
           trackedAt: nowMs,
         });

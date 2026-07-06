@@ -14,7 +14,11 @@ import { API_URLS } from './exports.js';
   const BEACON_LEAVE_URL = API_URLS.BEACON_LEAVE;
   const BEACON_END_EVENT_URL = API_URLS.BEACON_END_EVENT;
   const FALLBACK_POPUP_DELAY_MS = 30000; // Show fallback popup after 30s if auto-attendance fails
-  const FALLBACK_POLL_INTERVAL_MS = 10000; // 10s safety-net poll (backup for MutationObserver)
+  // Confirmation windows: the "Leave call" button must persist before we trust a
+  // join (kills momentary DOM flickers) and must stay gone before we trust a leave
+  // (Meet rebuilds its control bar constantly during the call).
+  const JOIN_DWELL_MS = 3000; // leave-call must be present continuously for 3s (flicker guard, stays near real-time)
+  const LEAVE_DEBOUNCE_MS = 10000; // leave-call must be gone continuously for 10s
 
   // ==================== State ====================
 
@@ -22,12 +26,17 @@ import { API_URLS } from './exports.js';
   let isInCall = false;
   let joinReported = false;
   let callStartTime = null;
+  // After a manual "End Meet" the BDA is often still physically in the Meet (the
+  // leave-call button is still on screen). Suppress auto re-confirm until they truly
+  // leave (button disappears), so ending tracking doesn't instantly re-start it.
+  let suppressUntilRejoin = false;
   let checkInterval = null;
   let widget = null;
   let bdaInfo = null;
   let authChecked = false;
   let storedToken = null; // Cached for sendBeacon (can't set auth headers)
   let fallbackPopupTimeout = null;
+  let noMatchRetryTimeout = null; // pending retry of onCallDetected after a noMatch reply
   let beaconSent = false; // Prevent duplicate beacons per session
   let currentMeetLink = null; // The meet link for this session
   /** Stable id per in-call session for deduping end events (message + beacon) */
@@ -85,32 +94,18 @@ import { API_URLS } from './exports.js';
 
   // ==================== Call State Detection ====================
 
+  // ONLY the "Leave call" button proves the BDA is actually IN the call.
+  // The mic/camera toggles, self-preview <video>, and participant labels are ALL
+  // present in the pre-join green room too — using them counted lobby-sitting as
+  // "attended" (the false-positive that wrecked accuracy). Leave-call appears only
+  // after a real join, so it is the single trustworthy signal.
   function detectInCall() {
-    // Strategy 1: "Leave call" button exists (most reliable)
-    const leaveBtn =
+    return !!(
       document.querySelector('[aria-label="Leave call"]') ||
       document.querySelector('[aria-label="leave call"]') ||
       document.querySelector('[data-tooltip="Leave call"]') ||
-      document.querySelector('button[jsname="CQylAd"]');
-    if (leaveBtn) return true;
-
-    // Strategy 2: Microphone/camera controls visible (in-call UI)
-    const micBtn =
-      document.querySelector('[aria-label="Turn off microphone"]') ||
-      document.querySelector('[aria-label="Turn on microphone"]') ||
-      document.querySelector('[data-tooltip="Turn off microphone"]') ||
-      document.querySelector('[data-tooltip="Turn on microphone"]');
-    if (micBtn) return true;
-
-    // Strategy 3: Video elements present (participants' videos)
-    const videos = document.querySelectorAll('video');
-    if (videos.length > 0) return true;
-
-    // Strategy 4: Self-view or participant count visible
-    const participantCount = document.querySelector('[aria-label*="participant"]');
-    if (participantCount) return true;
-
-    return false;
+      document.querySelector('button[jsname="CQylAd"]')
+    );
   }
 
   // ==================== sendBeacon Leave (fire-and-forget) ====================
@@ -251,6 +246,16 @@ import { API_URLS } from './exports.js';
     const elapsed = Date.now() - callStartTime;
     const mins = Math.round(elapsed / 60000);
     return `${mins} min`;
+  }
+
+  // Wall-clock "In" time (local), e.g. "3:55 PM".
+  function formatClockTime(ms) {
+    if (!ms) return '—';
+    try {
+      return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    } catch {
+      return '—';
+    }
   }
 
   // ==================== Fallback In-Page Popup ====================
@@ -444,6 +449,11 @@ import { API_URLS } from './exports.js';
         notifyMeetingEnd('fallback_popup');
 
         isInCall = false;
+        suppressUntilRejoin = true;
+        callStartTime = null;
+        joinReported = false;
+        clearTimeout(noMatchRetryTimeout);
+        noMatchRetryTimeout = null;
         clearSession();
         clearInterval(popupDurInterval);
         removeFallbackPopup();
@@ -507,13 +517,16 @@ import { API_URLS } from './exports.js';
       }, FALLBACK_POPUP_DELAY_MS);
     }
 
-    // Immediately tell background to report join
+    // Immediately tell background to report join. Report the REAL join moment
+    // (callStartTime === leaveSeenSince, when the Leave-call button was first seen),
+    // not "now" — otherwise the dwell/confirmation delay skews the recorded join time
+    // and the server-side duration.
     chrome.runtime.sendMessage(
       {
         type: 'MEET_AUTO_JOIN',
         url: window.location.href,
         meetCode: extractMeetCode(),
-        joinedAt: new Date().toISOString(),
+        joinedAt: new Date(callStartTime || Date.now()).toISOString(),
       },
       (response) => {
         if (chrome.runtime.lastError) {
@@ -539,7 +552,12 @@ import { API_URLS } from './exports.js';
           console.warn('[FF-MEET] Meet landing / absent:', response?.error);
         } else if (response?.noMatch) {
           console.log('[FF-MEET] No matching meeting found, will retry...');
-          setTimeout(onCallDetected, 10000);
+          clearTimeout(noMatchRetryTimeout);
+          noMatchRetryTimeout = setTimeout(() => {
+            // Only retry if still genuinely in the call and not yet reported —
+            // guards against resurrecting a session that ended during the wait.
+            if (isInCall && !joinReported) onCallDetected();
+          }, 10000);
         } else {
           console.warn('[FF-MEET] Join report failed:', response?.error);
         }
@@ -557,6 +575,12 @@ import { API_URLS } from './exports.js';
 
     notifyMeetingEnd('meet_call_ended');
 
+    // Reset session state so the live timer stops and a genuine re-join is
+    // re-confirmed (and re-reported) as a fresh segment.
+    callStartTime = null;
+    joinReported = false;
+    clearTimeout(noMatchRetryTimeout); // cancel any pending noMatch retry
+    noMatchRetryTimeout = null;
     clearSession();
     removeFallbackPopup();
     updateWidgetState('idle', 'Call ended - ' + duration);
@@ -824,6 +848,25 @@ import { API_URLS } from './exports.js';
         .ff-dur { font-size: 11px; color: #6b7280; margin-bottom: 10px; }
         .ff-dur span { font-weight: 600; color: #374151; }
 
+        .ff-stats {
+          display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+          margin-bottom: 10px;
+        }
+        .ff-stat {
+          display: flex; flex-direction: column; gap: 2px;
+          padding: 8px 10px; background: #f9fafb;
+          border: 1px solid #f3f4f6; border-radius: 8px;
+        }
+        .ff-stat-l {
+          font-size: 9px; font-weight: 700; letter-spacing: 0.5px;
+          text-transform: uppercase; color: #9ca3af;
+        }
+        .ff-stat-v {
+          font-size: 15px; font-weight: 700; color: #374151;
+          font-variant-numeric: tabular-nums;
+        }
+        .ff-stat-v.ff-stat-dur { color: #ff5722; }
+
         .ff-info {
           font-size: 11px; color: #6b7280; margin-bottom: 10px;
           padding: 8px; background: #f9fafb; border-radius: 6px;
@@ -893,8 +936,15 @@ import { API_URLS } from './exports.js';
             <div class="ff-dot detecting" id="ff-dot"></div>
             <span id="ff-status">Detecting call...</span>
           </div>
-          <div class="ff-dur" id="ff-dur" style="display:none;">
-            Duration: <span id="ff-dur-val" style="font-size:14px; font-weight:700;">0:00</span>
+          <div class="ff-stats" id="ff-dur" style="display:none;">
+            <div class="ff-stat">
+              <span class="ff-stat-l">In</span>
+              <span class="ff-stat-v" id="ff-in-val">—</span>
+            </div>
+            <div class="ff-stat">
+              <span class="ff-stat-l">Duration</span>
+              <span class="ff-stat-v ff-stat-dur" id="ff-dur-val">0:00</span>
+            </div>
           </div>
           <div class="ff-meet-link" id="ff-meet-link" style="display:none; font-size:9px; color:#9ca3af; margin-bottom:8px; word-break:break-all;"></div>
           <div class="ff-info" id="ff-info" style="display:none;">
@@ -958,6 +1008,11 @@ import { API_URLS } from './exports.js';
       notifyMeetingEnd('meet_widget');
 
       isInCall = false;
+      suppressUntilRejoin = true;
+      callStartTime = null;
+      joinReported = false;
+      clearTimeout(noMatchRetryTimeout);
+      noMatchRetryTimeout = null;
       clearSession();
       removeFallbackPopup();
       updateWidgetState('idle', 'Call ended - ' + duration);
@@ -1015,7 +1070,7 @@ import { API_URLS } from './exports.js';
 
     // Show duration + meet link + End Meet when in-call or present
     if (state === 'in-call' || state === 'present') {
-      if (dur) dur.style.display = 'block';
+      if (dur) dur.style.display = 'grid';
       if (noMatch) noMatch.style.display = 'none';
       if (meetLinkEl) {
         meetLinkEl.style.display = 'block';
@@ -1066,11 +1121,13 @@ import { API_URLS } from './exports.js';
 
     const elapsed = getElapsedStr();
 
-    // Card duration
+    // Card In time + duration
     const dur = document.getElementById('ff-dur');
     const durVal = document.getElementById('ff-dur-val');
-    if (dur) dur.style.display = 'block';
+    const inVal = document.getElementById('ff-in-val');
+    if (dur) dur.style.display = 'grid';
     if (durVal) durVal.textContent = elapsed;
+    if (inVal) inVal.textContent = formatClockTime(callStartTime);
 
     // External duration (always visible next to toggle)
     const extDur = document.getElementById('ff-ext-dur');
@@ -1112,53 +1169,53 @@ import { API_URLS } from './exports.js';
 
   // ==================== Main Loop (MutationObserver + fallback poll) ====================
 
-  let prevInCall = false;
   let pendingCheck = false;
+  let leaveSeenSince = null; // first ms the leave-call button was seen (current streak)
+  let leaveGoneSince = null; // first ms the leave-call button went missing (current streak)
 
   function tick() {
-    const nowInCall = detectInCall();
+    const present = detectInCall();
+    const now = Date.now();
 
-    // Transition: not in call -> in call
-    if (nowInCall && !prevInCall) {
-      console.log('[FF-MEET] Call joined!');
-      sessionEndRequestId = null;
-      isInCall = true;
-      if (!callStartTime) callStartTime = Date.now();
-      currentMeetLink = window.location.href;
-      saveSession(currentMeetLink, callStartTime);
+    if (present) {
+      leaveGoneSince = null;
+      if (leaveSeenSince == null) leaveSeenSince = now;
 
-      // Show live timer and End Meet immediately
-      if (joinReported) {
-        updateWidgetState('present', 'Present');
-      } else {
-        updateWidgetState('in-call', 'In call');
+      // Confirm the join only after the button has persisted for the dwell window.
+      // callStartTime anchors to when the button was FIRST seen, so duration counts
+      // from the real moment of joining — not from this delayed confirmation.
+      if (!isInCall && !suppressUntilRejoin && now - leaveSeenSince >= JOIN_DWELL_MS) {
+        console.log('[FF-MEET] Join confirmed (leave-call stable for', JOIN_DWELL_MS / 1000, 's)');
+        sessionEndRequestId = null;
+        isInCall = true;
+        // Keep a restored join time (survives page reload); else anchor to first-seen.
+        if (callStartTime == null) callStartTime = leaveSeenSince;
+        currentMeetLink = window.location.href;
+        saveSession(currentMeetLink, callStartTime);
+
+        updateWidgetState(joinReported ? 'present' : 'in-call', joinReported ? 'Present' : 'In call');
+        attachLeaveButtonInterceptor();
+        if (!joinReported) onCallDetected();
+      } else if (!isInCall && !suppressUntilRejoin) {
+        // Dwell in progress — show a verifying state, no report yet.
+        updateWidgetState('detecting', 'Verifying join…');
       }
-
-      // Attach leave button interceptor
-      attachLeaveButtonInterceptor();
-
-      // Immediately report join
-      if (!joinReported) {
-        onCallDetected();
+    } else {
+      // Leave-call button absent. Require SUSTAINED absence (debounce) before acting —
+      // Meet rebuilds its control bar constantly, so one missing tick is a flicker,
+      // not a leave. This gates clearing suppressUntilRejoin too: otherwise a single
+      // flicker after a manual End Meet would instantly re-arm and re-report.
+      leaveSeenSince = null;
+      if (leaveGoneSince == null) leaveGoneSince = now;
+      if (now - leaveGoneSince >= LEAVE_DEBOUNCE_MS) {
+        suppressUntilRejoin = false; // truly left the call — re-arm auto detection
+        if (isInCall) onCallEnded();
+        leaveGoneSince = null;
       }
     }
 
-    // Transition: in call -> not in call
-    if (!nowInCall && prevInCall) {
-      onCallEnded();
-    }
-
-    prevInCall = nowInCall;
-
-    // Keep duration updated
-    if (isInCall || callStartTime) {
-      updateDuration();
-    }
-
-    // Re-attach leave button interceptor periodically (Meet may recreate buttons)
-    if (isInCall) {
-      attachLeaveButtonInterceptor();
-    }
+    if (isInCall || callStartTime) updateDuration();
+    if (isInCall) attachLeaveButtonInterceptor();
   }
 
   // ==================== Init ====================
@@ -1239,13 +1296,10 @@ import { API_URLS } from './exports.js';
     });
     domObserver.observe(document.body, { childList: true, subtree: true });
 
-    // FALLBACK: 10s poll as safety net (in case MutationObserver misses something)
-    checkInterval = setInterval(tick, FALLBACK_POLL_INTERVAL_MS);
-
-    // Duration display updates every second for smooth timer
-    setInterval(() => {
-      if (isInCall || callStartTime) updateDuration();
-    }, 1000);
+    // 1s loop drives both the live timer AND the join-dwell / leave-debounce state
+    // machine, so confirmation windows resolve at second precision even when Google
+    // Meet stops mutating the DOM (e.g. while sitting on a missing control bar).
+    checkInterval = setInterval(tick, 1000);
 
     // Initial check
     tick();

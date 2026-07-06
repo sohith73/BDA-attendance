@@ -303,6 +303,8 @@ function showDashboard() {
       bdaInfo.name && String(bdaInfo.name).trim() ? String(bdaInfo.name).trim() : bdaInfo.email || '';
     bdaDisplayName.textContent = displayName;
     bdaDisplayEmail.textContent = bdaInfo.email || '';
+    const avatar = document.getElementById('bda-avatar');
+    if (avatar) avatar.textContent = initials(displayName || bdaInfo.email || '?');
   }
 
   loadMeetings();
@@ -431,26 +433,82 @@ function renderMeetingCard(meeting, context) {
   const timeStr = formatDateTime(start);
 
   const claimedByStr = meeting.claimedBy
-    ? `<div class="meeting-assigned">Assigned: ${escapeHtml(meeting.claimedBy.name || meeting.claimedBy.email)}</div>`
+    ? `<div class="meeting-assigned">Assigned to ${escapeHtml(meeting.claimedBy.name || meeting.claimedBy.email)}</div>`
     : '';
+
+  const liveDot = status === 'active' ? '<span class="badge-dot"></span>' : '';
+
+  const actions =
+    (canMark
+      ? `<button type="button" class="btn-mark" data-booking-id="${meeting.bookingId}" data-client-name="${escapeHtml(meeting.clientName)}">Mark Present</button>`
+      : '') +
+    (canEnd
+      ? `<button type="button" class="btn-end" data-booking-id="${meeting.bookingId}" data-meet-link="${meetAttr}">End Meet</button>`
+      : '');
 
   return `
     <div class="meeting-card status-${status}">
-      <div class="meeting-client">${escapeHtml(meeting.clientName)}</div>
-      <div class="meeting-time">${timeStr}</div>
+      <div class="mc-head">
+        <div class="mc-avatar status-${status}">${escapeHtml(initials(meeting.clientName))}</div>
+        <div class="mc-id">
+          <div class="meeting-client">${escapeHtml(meeting.clientName)}</div>
+          <div class="meeting-time">${timeStr}</div>
+        </div>
+        <span class="meeting-badge ${badgeClass}">${liveDot}${badgeText}</span>
+      </div>
       ${claimedByStr}
-      <div class="meeting-meta">
-        <span class="meeting-badge ${badgeClass}">${badgeText}</span>
-        ${
-          canMark
-            ? `<button type="button" class="btn-mark" data-booking-id="${meeting.bookingId}" data-client-name="${escapeHtml(meeting.clientName)}">Mark Present</button>`
-            : ''
-        }
-        ${
-          canEnd
-            ? `<button type="button" class="btn-end" data-booking-id="${meeting.bookingId}" data-meet-link="${meetAttr}">End Meet</button>`
-            : ''
-        }
+      ${renderAttendanceDetail(meeting.attendance)}
+      ${actions ? `<div class="meeting-meta">${actions}</div>` : ''}
+    </div>`;
+}
+
+// First letters of a client name → avatar monogram, e.g. "Ashraya Rao" → "AR".
+function initials(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+// In / Out / Duration / who-joined block. Shown once attendance exists.
+function renderAttendanceDetail(att) {
+  if (!att) return '';
+
+  if (att.status === 'absent') {
+    return `
+      <div class="att-detail att-detail-absent">
+        <span class="att-absent-icon">&#x274C;</span>
+        <span>Marked <strong>Absent</strong>${att.bdaName ? ` &middot; ${escapeHtml(att.bdaName)}` : ''}</span>
+      </div>`;
+  }
+
+  // Manual mark is a point-in-time confirmation — no real in/out/duration is
+  // tracked, so render it as a single stamp instead of a fake ongoing call.
+  if (att.status === 'manual') {
+    return `
+      <div class="att-detail att-detail-manual">
+        <span class="att-manual-icon">&#x270B;</span>
+        <span>Marked <strong>Present</strong> (manual)${att.bdaName ? ` &middot; ${escapeHtml(att.bdaName)}` : ''}${att.joinedAt ? ` &middot; ${formatClock(att.joinedAt)}` : ''}</span>
+      </div>`;
+  }
+
+  // present / unmarked with any captured timing. "In call" only while a present
+  // session is still open (leftAt null); never for manual/unmarked.
+  const inStr = att.joinedAt ? formatClock(att.joinedAt) : '—';
+  const outStr = att.leftAt ? formatClock(att.leftAt) : (att.status === 'present' ? 'In call' : '—');
+  const durStr = att.durationMs != null ? formatDuration(att.durationMs) : '—';
+
+  const whoRow = att.bdaName
+    ? `<div class="att-who"><span class="att-label">BDA</span> ${escapeHtml(att.bdaName)}</div>`
+    : '';
+
+  return `
+    <div class="att-detail">
+      ${whoRow}
+      <div class="att-grid">
+        <div class="att-cell"><span class="att-label">In</span><span class="att-value">${inStr}</span></div>
+        <div class="att-cell"><span class="att-label">Out</span><span class="att-value">${outStr}</span></div>
+        <div class="att-cell"><span class="att-label">Duration</span><span class="att-value att-dur">${durStr}</span></div>
       </div>
     </div>`;
 }
@@ -674,6 +732,20 @@ function formatTime(date) {
     minute: '2-digit',
     hour12: true,
   });
+}
+
+// Clock time (IST) for In/Out columns — e.g. "3:55 PM".
+function formatClock(date) {
+  return formatTime(date);
+}
+
+// Human duration from ms — e.g. "0 min", "57 min", "1h 05m".
+function formatDuration(ms) {
+  const totalMin = Math.max(0, Math.round(Number(ms) / 60000));
+  if (totalMin < 60) return `${totalMin} min`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return `${h}h ${String(m).padStart(2, '0')}m`;
 }
 
 function escapeHtml(str) {

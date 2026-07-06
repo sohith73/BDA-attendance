@@ -37,12 +37,13 @@
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  background: linear-gradient(180deg, #fff5f0 0%, #ffffff 40%, #fff0f0 100%);
+  background: #f4f5f7;
   color: var(--ff-gray-800);
   font-size: 14px;
   line-height: 1.5;
   min-height: 100vh;
   overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
 /* ==================== Setup Screen ==================== */
@@ -268,38 +269,73 @@ body {
 }
 
 .dashboard-header {
-  padding: 16px 20px;
-  background: linear-gradient(135deg, var(--ff-orange), var(--ff-orange-light));
+  padding: 18px 18px;
+  background: linear-gradient(135deg, #ff5722 0%, #ff7a45 100%);
   color: white;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  box-shadow: 0 4px 18px rgba(255, 87, 34, 0.28);
+}
+
+.header-avatar {
+  width: 42px;
+  height: 42px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.22);
+  border: 1.5px solid rgba(255, 255, 255, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.header-info {
+  flex: 1;
+  min-width: 0;
 }
 
 .header-info h2 {
   font-size: 16px;
   font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .header-info p {
   font-size: 11px;
-  opacity: 0.85;
-  margin-top: 2px;
+  opacity: 0.9;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .btn-logout {
-  padding: 6px 12px;
-  background: rgba(255, 255, 255, 0.2);
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.18);
   color: white;
   border: 1px solid rgba(255, 255, 255, 0.3);
-  border-radius: var(--ff-radius-sm);
-  font-size: 12px;
+  border-radius: 50%;
   cursor: pointer;
-  transition: background var(--ff-transition);
+  transition: background var(--ff-transition), transform var(--ff-transition);
 }
 
 .btn-logout:hover {
-  background: rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.34);
+  transform: translateY(-1px);
 }
 
 .dashboard-body {
@@ -315,94 +351,254 @@ body {
 }
 
 .section-title {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.8px;
+  letter-spacing: 1px;
   color: var(--ff-gray-500);
   margin-bottom: 10px;
-  padding-left: 4px;
+  padding-left: 2px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-title::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--ff-gray-200);
 }
 
 /* ==================== Meeting Card ==================== */
 
 .meeting-card {
+  position: relative;
   background: white;
   border-radius: var(--ff-radius-lg);
-  padding: 14px 16px;
-  margin-bottom: 10px;
-  box-shadow: var(--ff-shadow);
-  border-left: 4px solid var(--ff-gray-300);
-  transition: all var(--ff-transition);
+  padding: 14px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 16px rgba(16, 24, 40, 0.06);
+  border: 1px solid var(--ff-gray-100);
+  overflow: hidden;
+  transition: box-shadow var(--ff-transition), transform var(--ff-transition);
+}
+
+.meeting-card::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--ff-gray-300);
 }
 
 .meeting-card:hover {
-  box-shadow: var(--ff-shadow-lg);
+  box-shadow: 0 2px 4px rgba(16, 24, 40, 0.06), 0 10px 28px rgba(16, 24, 40, 0.10);
+  transform: translateY(-1px);
 }
 
-.meeting-card.status-pending {
-  border-left-color: var(--ff-gray-300);
+.meeting-card.status-pending::before { background: var(--ff-gray-300); }
+.meeting-card.status-active::before {
+  background: var(--ff-orange);
+  animation: pulse-bar 2s ease-in-out infinite;
+}
+.meeting-card.status-present::before { background: var(--ff-green); }
+.meeting-card.status-absent::before { background: var(--ff-red); }
+.meeting-card.status-manual::before { background: var(--ff-amber); }
+
+@keyframes pulse-bar {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
-.meeting-card.status-active {
-  border-left-color: var(--ff-orange);
-  animation: pulse-border 2s ease-in-out infinite;
+/* ---- Card head: avatar + name/time + badge ---- */
+
+.mc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
-.meeting-card.status-present {
-  border-left-color: var(--ff-green);
+.mc-avatar {
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: white;
+  background: linear-gradient(135deg, #9ca3af, #6b7280);
 }
 
-.meeting-card.status-absent {
-  border-left-color: var(--ff-red);
-}
+.mc-avatar.status-active { background: linear-gradient(135deg, #ff7a45, #ff5722); }
+.mc-avatar.status-present { background: linear-gradient(135deg, #34d399, #059669); }
+.mc-avatar.status-manual { background: linear-gradient(135deg, #fbbf24, #d97706); }
+.mc-avatar.status-absent { background: linear-gradient(135deg, #f87171, #dc2626); }
 
-.meeting-card.status-manual {
-  border-left-color: var(--ff-amber);
-}
-
-@keyframes pulse-border {
-  0%, 100% { border-left-color: var(--ff-orange); }
-  50% { border-left-color: #ffab91; }
+.mc-id {
+  flex: 1;
+  min-width: 0;
 }
 
 .meeting-client {
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 14.5px;
+  font-weight: 700;
   color: var(--ff-gray-900);
-  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .meeting-time {
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--ff-gray-500);
-  margin-bottom: 8px;
+  margin-top: 1px;
 }
 
 .meeting-assigned {
   font-size: 11px;
-  color: var(--ff-gray-500);
-  margin-bottom: 8px;
-  font-style: italic;
+  color: var(--ff-gray-400);
+  margin-top: 8px;
+  padding-left: 2px;
+}
+
+/* ==================== Attendance Detail (In / Out / Duration / BDA) ==================== */
+
+.att-detail {
+  margin-top: 12px;
+  padding: 12px;
+  background: linear-gradient(180deg, #fafbfc, #f6f7f9);
+  border: 1px solid var(--ff-gray-100);
+  border-radius: var(--ff-radius);
+}
+
+.att-who {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--ff-gray-800);
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.att-who .att-label {
+  padding: 2px 7px;
+  background: var(--ff-gray-100);
+  border-radius: 6px;
+}
+
+.att-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.att-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  background: white;
+  border: 1px solid var(--ff-gray-100);
+  border-radius: var(--ff-radius-sm);
+}
+
+.att-label {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ff-gray-400);
+}
+
+.att-value {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ff-gray-800);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.att-value.att-dur {
+  color: var(--ff-orange);
+}
+
+.att-detail-absent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 10px;
+  padding: 10px 12px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--ff-radius);
+  font-size: 12px;
+  color: #991b1b;
+}
+
+.att-absent-icon {
+  font-size: 13px;
+}
+
+.att-detail-manual {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: var(--ff-radius);
+  font-size: 12px;
+  color: #92400e;
+}
+
+.att-manual-icon {
+  font-size: 13px;
 }
 
 .meeting-meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: flex-end;
   gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ff-gray-100);
+}
+
+.meeting-meta .btn-mark,
+.meeting-meta .btn-end {
+  flex: 1;
 }
 
 .meeting-badge {
+  flex-shrink: 0;
   display: inline-flex;
   align-items: center;
-  padding: 3px 10px;
+  gap: 5px;
+  padding: 4px 10px;
   border-radius: 20px;
-  font-size: 11px;
-  font-weight: 600;
+  font-size: 10.5px;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.3px;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+
+.badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: pulse-dot 1.4s ease-in-out infinite;
 }
 
 .badge-pending {
@@ -431,12 +627,12 @@ body {
 }
 
 .btn-mark {
-  padding: 5px 12px;
+  padding: 9px 12px;
   background: var(--ff-green);
   color: white;
   border: none;
-  border-radius: var(--ff-radius-sm);
-  font-size: 11px;
+  border-radius: var(--ff-radius);
+  font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
   transition: all var(--ff-transition);
@@ -445,36 +641,39 @@ body {
 .btn-mark:hover {
   background: var(--ff-green-dark);
   transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
 }
 
 .btn-mark:disabled {
-  background: var(--ff-gray-300);
+  background: var(--ff-gray-200);
   color: var(--ff-gray-500);
   cursor: not-allowed;
   transform: none;
+  box-shadow: none;
 }
 
 .btn-end {
-  padding: 5px 12px;
-  margin-left: 6px;
-  background: #dc2626;
-  color: white;
-  border: none;
-  border-radius: var(--ff-radius-sm);
-  font-size: 11px;
+  padding: 9px 12px;
+  background: white;
+  color: var(--ff-red-dark);
+  border: 1.5px solid #fecaca;
+  border-radius: var(--ff-radius);
+  font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
   transition: all var(--ff-transition);
 }
 
 .btn-end:hover {
-  background: #b91c1c;
+  background: #fef2f2;
+  border-color: #fca5a5;
   transform: translateY(-1px);
 }
 
 .btn-end:disabled {
-  background: var(--ff-gray-300);
-  color: var(--ff-gray-500);
+  background: var(--ff-gray-100);
+  color: var(--ff-gray-400);
+  border-color: var(--ff-gray-200);
   cursor: not-allowed;
   transform: none;
 }
