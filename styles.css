@@ -608,6 +608,61 @@ body {
   color: var(--ff-orange);
 }
 
+/* Verified / punctuality chips (Meet REST API data) */
+.att-chiprow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.att-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  font-size: 10.5px;
+  font-weight: 700;
+  border-radius: 999px;
+  letter-spacing: 0.2px;
+}
+
+.att-chip-verified {
+  background: #e8f0fe;
+  color: #1a56db;
+  border: 1px solid #c6d8fb;
+}
+
+.att-chip-ontime {
+  background: #e6f6ec;
+  color: #0a7d33;
+  border: 1px solid #bfe6cd;
+}
+
+.att-chip-late {
+  background: #fdeaea;
+  color: #b91c1c;
+  border: 1px solid #f6c8c8;
+}
+
+/* Who was already in the call when the BDA joined */
+.att-roster {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--ff-gray-800);
+  line-height: 1.5;
+}
+
+.att-roster .att-label {
+  flex-shrink: 0;
+  padding: 2px 7px;
+  background: var(--ff-gray-100);
+  border-radius: 6px;
+}
+
 .att-detail-absent {
   display: flex;
   align-items: center;

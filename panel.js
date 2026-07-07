@@ -591,10 +591,11 @@ function renderAttendanceDetail(att) {
   if (!att) return '';
 
   if (att.status === 'absent') {
+    const src = att.source === 'meet_api' ? ' &middot; from Google Meet records' : '';
     return `
       <div class="att-detail att-detail-absent">
         <span class="att-absent-icon">&#x274C;</span>
-        <span>Marked <strong>Absent</strong>${att.bdaName ? ` &middot; ${escapeHtml(att.bdaName)}` : ''}</span>
+        <span>Marked <strong>Absent</strong>${att.bdaName ? ` &middot; ${escapeHtml(att.bdaName)}` : ''}${src}</span>
       </div>`;
   }
 
@@ -618,6 +619,29 @@ function renderAttendanceDetail(att) {
     ? `<div class="att-who"><span class="att-label">BDA</span> ${escapeHtml(att.bdaName)}</div>`
     : '';
 
+  // Chips: verified source + punctuality (Meet REST API rows only).
+  const chips = [];
+  if (att.source === 'meet_api') {
+    chips.push('<span class="att-chip att-chip-verified">&#x2713; Google Meet</span>');
+  }
+  if (att.lateByMs != null) {
+    if (att.lateByMs <= 60 * 1000) {
+      const early = att.lateByMs < -60 * 1000
+        ? ` (${formatDuration(-att.lateByMs)} early)` : '';
+      chips.push(`<span class="att-chip att-chip-ontime">On time${early}</span>`);
+    } else {
+      chips.push(`<span class="att-chip att-chip-late">Late by ${formatDuration(att.lateByMs)}</span>`);
+    }
+  }
+  const chipRow = chips.length ? `<div class="att-chiprow">${chips.join('')}</div>` : '';
+
+  // Who was already in the call when the BDA joined (from Google's records).
+  const roster = Array.isArray(att.participantsAtJoin) && att.participantsAtJoin.length
+    ? `<div class="att-roster"><span class="att-label">In call at join</span> ${
+        att.participantsAtJoin.map((p) => escapeHtml(p.displayName || 'Unknown')).join(', ')
+      }</div>`
+    : '';
+
   return `
     <div class="att-detail">
       ${whoRow}
@@ -626,6 +650,8 @@ function renderAttendanceDetail(att) {
         <div class="att-cell"><span class="att-label">Out</span><span class="att-value">${outStr}</span></div>
         <div class="att-cell"><span class="att-label">Duration</span><span class="att-value att-dur">${durStr}</span></div>
       </div>
+      ${chipRow}
+      ${roster}
     </div>`;
 }
 

@@ -918,6 +918,20 @@
         .ff-ext-end:hover { background: #b91c1c; }
         .ff-ext-end:disabled { background: #d1d5db; cursor: not-allowed; }
 
+        .ff-ext-mark {
+          display: none;
+          margin-top: 8px;
+          padding: 6px 14px;
+          background: #10b981; color: white; border: none;
+          border-radius: 20px; font-size: 11px; font-weight: 600;
+          cursor: pointer; transition: background 0.2s;
+          box-shadow: 0 2px 8px rgba(16, 185, 129, 0.4);
+          white-space: nowrap;
+        }
+        .ff-ext-mark:hover { background: #059669; }
+        .ff-ext-mark:disabled { background: #d1d5db; color: #6b7280; cursor: not-allowed; }
+        .ff-ext-mark.done { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; cursor: default; }
+
         .ff-ext-dur {
           display: none;
           margin-top: 4px;
@@ -936,6 +950,7 @@
         <img class="ff-logo" src="${chrome.runtime.getURL('icons/icon48.png')}" alt="FlashFire" draggable="false" />
       </button>
       <div class="ff-ext-dur" id="ff-ext-dur">0:00</div>
+      <button class="ff-ext-mark" id="ff-ext-mark">Mark Present</button>
       <button class="ff-ext-end" id="ff-ext-end">End Meet</button>
 
       <div class="ff-card" id="ff-card">
@@ -1043,6 +1058,12 @@
       // Trigger the same logic as the card End Meet button
       document.getElementById('ff-end-btn').click();
     });
+
+    // External Mark Present button (visible next to toggle in a matched call).
+    // Delegates to the card button so gating/marking logic stays in one place.
+    document.getElementById('ff-ext-mark').addEventListener('click', () => {
+      document.getElementById('ff-btn').click();
+    });
   }
 
   function endMeetAction() {
@@ -1065,6 +1086,7 @@
     const btn = document.getElementById('ff-btn');
     const endBtn = document.getElementById('ff-end-btn');
     const extEnd = document.getElementById('ff-ext-end');
+    const extMark = document.getElementById('ff-ext-mark');
     const extDur = document.getElementById('ff-ext-dur');
     const dur = document.getElementById('ff-dur');
     const meetLinkEl = document.getElementById('ff-meet-link');
@@ -1110,9 +1132,29 @@
         extDur.style.display = 'block';
         extDur.textContent = getElapsedStr();
       }
+      // External Mark Present pill — only for a matched booking; flips to a
+      // green "✓ Present" once attendance is recorded.
+      if (extMark) {
+        if (state === 'present' || joinReported) {
+          extMark.style.display = 'block';
+          extMark.textContent = '✓ Present';
+          extMark.classList.add('done');
+          extMark.disabled = true;
+        } else if (currentBooking) {
+          extMark.style.display = 'block';
+        } else {
+          extMark.style.display = 'none';
+        }
+      }
     } else if (state === 'idle') {
       if (endBtn) endBtn.style.display = 'none';
       if (extEnd) { extEnd.style.display = 'none'; }
+      if (extMark) {
+        extMark.style.display = 'none';
+        extMark.classList.remove('done');
+        extMark.disabled = false;
+        extMark.textContent = 'Mark Present';
+      }
       if (extDur) { extDur.style.display = 'none'; }
       if (meetLinkEl) meetLinkEl.style.display = 'none';
     }
@@ -1191,6 +1233,13 @@
       const startIso = currentBooking?.scheduledStart;
       const t = startIso ? formatClockTime(new Date(startIso).getTime()) : '';
       btn.textContent = t ? `Mark opens near ${t}` : 'Mark Present';
+    }
+
+    // Mirror the gate onto the external pill so both buttons agree.
+    const ext = document.getElementById('ff-ext-mark');
+    if (ext && !ext.classList.contains('done')) {
+      ext.disabled = btn.disabled;
+      ext.textContent = btn.textContent;
     }
   }
 
