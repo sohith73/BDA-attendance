@@ -39,6 +39,10 @@
   let checkInterval = null;
   let initStarted = false; // init() setup ran once (observers + call-detection loop)
   let widget = null;
+  // Overlay hidden for screen sharing. In-memory only, so a page reload always
+  // brings the overlay back; opening the extension panel un-hides it too
+  // (SHOW_OVERLAY message). Tracking keeps running while hidden.
+  let overlayHidden = false;
   let bdaInfo = null;
   let authChecked = false;
   let storedToken = null; // Cached for sendBeacon (can't set auth headers)
@@ -267,9 +271,42 @@
 
   // ==================== Fallback In-Page Popup ====================
 
+  function setOverlayHidden(hidden) {
+    overlayHidden = hidden;
+    // !important so no widget stylesheet rule can override the hide.
+    if (widget) {
+      if (hidden) widget.style.setProperty('display', 'none', 'important');
+      else widget.style.removeProperty('display');
+    }
+    const popup = document.getElementById('ff-fallback-popup');
+    if (popup) {
+      if (hidden) popup.style.setProperty('display', 'none', 'important');
+      else popup.style.removeProperty('display');
+    }
+  }
+
+  // Bind a hide control via raw pointer events in the CAPTURE phase.
+  // Plain 'click' is unreliable here: the drag system's pointer capture (and
+  // Meet's own listeners) can retarget or swallow the synthesized click, but
+  // pointerdown/up always fire on the element actually under the pointer.
+  function bindHideControl(el) {
+    if (!el) return;
+    el.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+    }, true);
+    el.addEventListener('pointerup', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      setOverlayHidden(true);
+    }, true);
+  }
+
   function showFallbackPopup() {
     // Don't show if attendance already confirmed
     if (joinReported) return;
+    // Don't pop up over a screen share the BDA explicitly hid the overlay for
+    if (overlayHidden) return;
     if (document.getElementById('ff-fallback-popup')) return;
 
     const hasBooking = !!currentBooking;
@@ -392,6 +429,7 @@
                 Mark Present
               </button>
               <button class="ff-popup-min" id="ff-popup-min-btn">Minimize</button>
+              <button class="ff-popup-min" id="ff-popup-hide-btn" title="Hide the overlay completely (e.g. while screen sharing). Reopen the extension or reload the page to show it again.">Hide</button>
             </div>
           </div>
         </div>
@@ -477,6 +515,9 @@
         if (card) card.classList.add('minimized');
       });
     }
+
+    // Hide button — hides BOTH the popup and the floating widget (screen share)
+    bindHideControl(document.getElementById('ff-popup-hide-btn'));
 
     // Click on pill area to expand back
     const pillArea = popup.querySelector('.ff-popup-pill');
@@ -590,6 +631,9 @@
     noMatchRetryTimeout = null;
     clearSession();
     removeFallbackPopup();
+    // Screen share is over with the call — bring a hidden overlay back so the
+    // next call always starts visible.
+    setOverlayHidden(false);
     updateWidgetState('idle', 'Call ended - ' + duration);
   }
 
@@ -688,7 +732,10 @@
       'pointerdown',
       (e) => {
         if (e.button !== 0) return;
-        if (e.target.closest('#ff-btn')) return;
+        // Never start a drag (pointer capture) from an interactive control —
+        // capture retargets the click away from the button, so its handler
+        // never fires. The toggle logo stays draggable (click = open card).
+        if (e.target.closest('button') && !e.target.closest('#ff-toggle')) return;
         const toggleEl = e.target.closest('#ff-toggle');
         const rect = widget.getBoundingClientRect();
         widgetDrag = {
@@ -932,6 +979,17 @@
         .ff-ext-mark:disabled { background: #d1d5db; color: #6b7280; cursor: not-allowed; }
         .ff-ext-mark.done { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; cursor: default; }
 
+        .ff-ext-hide {
+          display: none;
+          margin-top: 6px;
+          padding: 4px 12px;
+          background: rgba(0,0,0,0.7); color: #d1d5db; border: none;
+          border-radius: 20px; font-size: 10px; font-weight: 600;
+          cursor: pointer; transition: background 0.2s;
+          white-space: nowrap;
+        }
+        .ff-ext-hide:hover { background: rgba(0,0,0,0.9); color: #fff; }
+
         .ff-ext-dur {
           display: none;
           margin-top: 4px;
@@ -943,6 +1001,16 @@
         }
 
         .ff-empty { font-size: 12px; color: #9ca3af; text-align: center; padding: 8px 0; }
+
+        .ff-hdr { position: relative; }
+        .ff-hide {
+          position: absolute; top: 8px; right: 8px;
+          width: 20px; height: 20px; border: none; border-radius: 50%;
+          background: rgba(255,255,255,0.25); color: #fff;
+          font-size: 11px; line-height: 20px; text-align: center;
+          cursor: pointer; padding: 0;
+        }
+        .ff-hide:hover { background: rgba(255,255,255,0.5); }
       </style>
 
       <button class="ff-toggle" id="ff-toggle" title="FlashFire Attendance">
@@ -952,9 +1020,11 @@
       <div class="ff-ext-dur" id="ff-ext-dur">0:00</div>
       <button class="ff-ext-mark" id="ff-ext-mark">Mark Present</button>
       <button class="ff-ext-end" id="ff-ext-end">End Meet</button>
+      <button class="ff-ext-hide" id="ff-ext-hide" title="Hide the overlay completely (e.g. while screen sharing). Reopen the extension or reload the page to show it again.">&#x2715; Hide</button>
 
       <div class="ff-card" id="ff-card">
         <div class="ff-hdr">
+          <button class="ff-hide" id="ff-hide" title="Hide the overlay completely (e.g. while screen sharing). Reopen the extension or reload the page to show it again.">&#x2715;</button>
           <h3>FlashFire Attendance</h3>
           <p id="ff-name">Loading...</p>
         </div>
@@ -1064,6 +1134,11 @@
     document.getElementById('ff-ext-mark').addEventListener('click', () => {
       document.getElementById('ff-btn').click();
     });
+
+    // Hide the whole overlay (widget + popup) for screen sharing. Tracking
+    // continues invisibly; reload or opening the extension panel restores it.
+    bindHideControl(document.getElementById('ff-hide'));
+    bindHideControl(document.getElementById('ff-ext-hide'));
   }
 
   function endMeetAction() {
@@ -1132,6 +1207,8 @@
         extDur.style.display = 'block';
         extDur.textContent = getElapsedStr();
       }
+      const extHide = document.getElementById('ff-ext-hide');
+      if (extHide) extHide.style.display = 'block';
       // External Mark Present pill — only for a matched booking; flips to a
       // green "✓ Present" once attendance is recorded.
       if (extMark) {
@@ -1149,6 +1226,8 @@
     } else if (state === 'idle') {
       if (endBtn) endBtn.style.display = 'none';
       if (extEnd) { extEnd.style.display = 'none'; }
+      const extHideIdle = document.getElementById('ff-ext-hide');
+      if (extHideIdle) extHideIdle.style.display = 'none';
       if (extMark) {
         extMark.style.display = 'none';
         extMark.classList.remove('done');
@@ -1200,6 +1279,11 @@
     }
     if (widget.style.zIndex !== '2147483647') {
       widget.style.zIndex = '2147483647';
+    }
+    // Re-assert the hidden state — nothing may resurface the overlay while
+    // the BDA is screen sharing.
+    if (overlayHidden && widget.style.display !== 'none') {
+      widget.style.setProperty('display', 'none', 'important');
     }
   }
 
@@ -1278,6 +1362,21 @@
         updateWidgetState('detecting', `Matched: ${message.clientName}`);
       }
       sendResponse({ success: true });
+    }
+
+    if (message.type === 'SHOW_OVERLAY') {
+      setOverlayHidden(false);
+      sendResponse({ success: true });
+    }
+
+    // Background recovery asks for the REAL call state: are we in the call,
+    // and when was the leave button first seen (true join anchor).
+    if (message.type === 'GET_CALL_STATE') {
+      sendResponse({
+        inCall: isInCall,
+        callStartTime: callStartTime || null,
+        joinReported,
+      });
     }
 
     if (message.type === 'MEET_ATTENDANCE_CONFIRMED') {

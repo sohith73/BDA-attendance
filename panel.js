@@ -62,6 +62,9 @@ let pendingEmail = null; // email waiting for OTP verification
 // ==================== Init ====================
 
 async function init() {
+  // Opening the panel restores any Meet overlay hidden for screen sharing.
+  sendMessage({ type: 'SHOW_MEET_OVERLAY' }).catch(() => {});
+
   const auth = await sendMessage({ type: 'GET_AUTH' });
   if (auth?.token) {
     token = auth.token;

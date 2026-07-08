@@ -284,6 +284,84 @@ async function firePopupNotification(meeting) {
 
 // ==================== Core Meeting Check Logic ====================
 
+const recoveryInFlight = new Set();
+
+/**
+ * Tab-based join recovery — runs on EVERY poll (≤30-60 s latency; it used to
+ * exist only inside the +5 min absent-check, which stamped joins minutes late).
+ *
+ * Two rules make it safe and accurate:
+ *  1. A join is reported ONLY when the tab's content script confirms it is in
+ *     the call (leave button present) — a bare Meet tab can still be the green
+ *     room, the original false-positive bug.
+ *  2. joinedAt = the content script's callStartTime (when the leave button was
+ *     FIRST seen), not "now" — so a recovered join carries the real join time.
+ *
+ * Returns 'reported' | 'unconfirmed' (matched tab but no in-call confirmation)
+ * | 'none' (no matching tab / nothing to do).
+ */
+async function tryTabRecovery(meeting, meetTabs) {
+  const bookingId = meeting.bookingId;
+  if (recoveryInFlight.has(bookingId)) return 'none';
+
+  let matchedTab = null;
+  for (const tab of meetTabs) {
+    const code = extractMeetCode(tab.url);
+    if (doesMeetMatchBooking(code, meeting)) {
+      matchedTab = tab;
+      break;
+    }
+  }
+  if (!matchedTab && meetTabs.length === 1 && bookingHasNoMeetCode(meeting)) {
+    matchedTab = meetTabs[0];
+  }
+  if (!matchedTab) return 'none';
+
+  let callState = null;
+  try {
+    callState = await chrome.tabs.sendMessage(matchedTab.id, { type: 'GET_CALL_STATE' });
+  } catch (_) {
+    return 'unconfirmed'; // content script unreachable — never guess
+  }
+  if (!callState?.inCall) return callState ? 'none' : 'unconfirmed';
+  if (callState.joinReported) return 'none';
+
+  recoveryInFlight.add(bookingId);
+  try {
+    const joinedAtIso = callState.callStartTime
+      ? new Date(callState.callStartTime).toISOString()
+      : new Date().toISOString();
+    const joinResult = await apiFetch(API.REPORT_JOIN, {
+      method: 'POST',
+      body: JSON.stringify({ bookingId, meetLink: matchedTab.url, joinedAt: joinedAtIso }),
+    });
+    if (joinResult?.success && !joinResult?.markedAbsent) {
+      await setTracked(bookingId, {
+        meetCode: extractMeetCode(matchedTab.url),
+        tabId: matchedTab.id,
+        reported: true,
+        joinedAt: callState.callStartTime || Date.now(),
+        leaveReported: false,
+        trackedAt: Date.now(),
+      });
+      // Flip the tab's widget to Present and stop its own re-reporting.
+      chrome.tabs.sendMessage(
+        matchedTab.id,
+        { type: 'MEET_ATTENDANCE_CONFIRMED', bookingId, clientName: meeting.clientName },
+        () => { void chrome.runtime.lastError; }
+      );
+      chrome.notifications.clear(`attend-${bookingId}`);
+      console.log(`[BDA-BG] Tab recovery reported join for ${bookingId} (joinedAt=${joinedAtIso})`);
+      return 'reported';
+    }
+  } catch (err) {
+    console.warn(`[BDA-BG] Tab recovery failed for ${bookingId}:`, err?.message || err);
+  } finally {
+    recoveryInFlight.delete(bookingId);
+  }
+  return 'none';
+}
+
 async function checkMeetings() {
   const hasAuth = await loadAuth();
   if (!hasAuth) return;
@@ -357,8 +435,17 @@ async function checkMeetings() {
     // green room apart from an actual in-call state, which was the core cause of
     // false "Present" marks. Real joins are reported by the Meet content script
     // (MEET_AUTO_JOIN) once it confirms the "Leave call" button has persisted.
-    // Here we only run the warn/absent timers below; the absent-check alarm keeps a
-    // tab-based late-join recovery as a last-resort safety net.
+
+    // ---- Fast tab recovery (every poll, ≤30-60 s; was only at +5 min) ----
+    // Safe: reports only with the content script's confirmed in-call state and
+    // uses its real callStartTime — see tryTabRecovery.
+    if (meetTabs.length > 0) {
+      const recovered = await tryTabRecovery(meeting, meetTabs);
+      if (recovered === 'reported') {
+        await fetchMeetings(true);
+        continue;
+      }
+    }
 
     // ---- warning: BDA not in meet, send Discord reminder (once per booking, server + client dedupe) ----
     if (nowMs >= startMs + WARN_AFTER_MS && !isHandled(bookingId)) {
@@ -699,46 +786,22 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       return;
     }
 
-    // Final re-check: if tab is open in real Meet room, report join instead of absent.
-    // Handles late joins around 2-3 min.
+    // Final re-check: shared tab recovery (confirmed in-call state + real
+    // callStartTime). If a matching tab exists but cannot be confirmed
+    // (content script unreachable), do NOT mark absent — the server-side
+    // Meet API verification settles it after the meeting.
     try {
       const meetTabs = await chrome.tabs.query({ url: 'https://meet.google.com/*' });
       const validTabs = meetTabs.filter((t) => !isGoogleMeetLandingUrl(t.url) && extractMeetCode(t.url));
-      let matchedTab = null;
       if (meeting) {
-        for (const tab of validTabs) {
-          const code = extractMeetCode(tab.url);
-          if (doesMeetMatchBooking(code, meeting)) {
-            matchedTab = tab;
-            break;
-          }
-        }
-      }
-
-      if (!matchedTab && meeting && validTabs.length === 1 && bookingHasNoMeetCode(meeting)) {
-        matchedTab = validTabs[0];
-      }
-
-      if (matchedTab && meeting) {
-        const joinResult = await apiFetch(API.REPORT_JOIN, {
-          method: 'POST',
-          body: JSON.stringify({
-            bookingId,
-            meetLink: matchedTab.url,
-            joinedAt: new Date().toISOString(),
-          }),
-        });
-        if (joinResult?.success && !joinResult?.markedAbsent) {
-          await setTracked(bookingId, {
-            meetCode: extractMeetCode(matchedTab.url),
-            tabId: matchedTab.id,
-            reported: true,
-            joinedAt: Date.now(),
-            leaveReported: false,
-            trackedAt: Date.now(),
-          });
-          chrome.notifications.clear(`attend-${bookingId}`);
+        const recovered = await tryTabRecovery(meeting, validTabs);
+        if (recovered === 'reported') {
           await fetchMeetings(true);
+          return;
+        }
+        if (recovered === 'unconfirmed') {
+          console.warn(`[BDA-BG] absent-check: matching tab unconfirmed for ${bookingId} — skipping absent mark`);
+          chrome.notifications.clear(`attend-${bookingId}`);
           return;
         }
       }
@@ -846,10 +909,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'SHOW_MEET_OVERLAY') {
+    // Panel opened — un-hide the overlay on every Meet tab (it may have been
+    // hidden for screen sharing).
+    chrome.tabs.query({ url: 'https://meet.google.com/*' }, (tabs) => {
+      for (const tab of tabs) {
+        chrome.tabs.sendMessage(tab.id, { type: 'SHOW_OVERLAY' }, () => {
+          void chrome.runtime.lastError; // tab without content script — ignore
+        });
+      }
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
   if (message.type === 'SET_AUTH') {
     token = message.token;
     bdaInfo = message.bdaInfo;
-    const expiresAt = Date.now() + 90 * 24 * 60 * 60 * 1000;
+    // Must match the server JWT lifetime (30d) so we re-login before the
+    // token actually expires, not 60 days after.
+    const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
     chrome.storage.local.set({
       bda_token: message.token,
       bda_info: message.bdaInfo,
@@ -1239,11 +1318,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // ==================== Startup ====================
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create('check-meetings', { periodInMinutes: 1 });
+  chrome.alarms.create('check-meetings', { periodInMinutes: 0.5 }); // 30s — tab recovery latency bound
 });
 
 chrome.runtime.onStartup.addListener(async () => {
-  chrome.alarms.create('check-meetings', { periodInMinutes: 1 });
+  chrome.alarms.create('check-meetings', { periodInMinutes: 0.5 }); // 30s — tab recovery latency bound
 
   // Recovery: check for tracked meetings that were never left (Chrome crash / force close)
   await loadAuth();
@@ -1299,7 +1378,7 @@ chrome.runtime.onStartup.addListener(async () => {
 (async () => {
   const hasAuth = await loadAuth();
   if (hasAuth) {
-    chrome.alarms.create('check-meetings', { periodInMinutes: 1 });
+    chrome.alarms.create('check-meetings', { periodInMinutes: 0.5 }); // 30s — tab recovery latency bound
 
     // Restart keepalive if there are active tracked meetings from previous session
     await loadTrackedState();
